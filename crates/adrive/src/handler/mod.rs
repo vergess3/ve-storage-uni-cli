@@ -18,3 +18,21 @@ pub mod auth;
 pub mod common;
 pub mod high_level;
 pub mod meta;
+
+pub mod share;
+mod share_receiver_auth;
+
+pub(crate) mod share_password;
+pub(crate) mod share_receive;
+pub(crate) mod share_view;
+
+mod download_ranges;
+pub(crate) mod share_checkpoint;
+pub(crate) mod share_content;
+mod share_content_ranges;
+pub(crate) mod share_download;
+mod share_download_progress;
+pub(crate) mod share_local;
+#[cfg(windows)]
+mod share_local_windows;
+pub(crate) mod share_manifest;

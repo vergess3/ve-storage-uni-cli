@@ -1656,11 +1656,11 @@ fn assert_english_tos_skill_export(export_dir: &std::path::Path, export_dir_arg:
         .join("tos_ls")
         .join("SKILL.md");
     let markdown = fs::read_to_string(&skill_path).expect("read exported skill");
-    assert!(markdown.starts_with("# tos_ls"), "markdown={markdown}");
     assert!(
-        markdown.contains("Use this skill when"),
+        markdown.starts_with("---\nname: tos-ls\n"),
         "markdown={markdown}"
     );
+    assert!(markdown.contains("Use when running"), "markdown={markdown}");
     assert!(markdown.contains("```json"), "markdown={markdown}");
 }
 
@@ -3152,6 +3152,156 @@ fn test_chinese_adrive_config_action_and_raw_api_recovery_are_localized() {
     );
     assert_eq!(api["data"]["mode"], "guarded_utility_passthrough");
     assert_eq!(api["data"]["raw_api_execution_implemented"], false);
+}
+
+#[test]
+fn test_adrive_utility_describe_preserves_actions_without_echoing_operands() {
+    // [Review Fix #Rebase4] Verify both dispatch paths and localization through
+    // the executable; config operands must not become public metadata paths.
+    let utility_cases: &[(&[&str], &str)] = &[
+        (&["config", "init"], "ve-adrive config init"),
+        (&["config", "show"], "ve-adrive config show"),
+        (
+            &["config", "set", "region", "operand-must-stay-private"],
+            "ve-adrive config set",
+        ),
+        (&["skill", "list"], "ve-adrive skill list"),
+        (&["skill", "ls"], "ve-adrive skill list"),
+        (&["skill", "export"], "ve-adrive skill export"),
+    ];
+    for (arguments, expected_command) in utility_cases {
+        for language in [None, Some("zh")] {
+            for is_leading in [false, true] {
+                let invocation = adrive_utility_describe_arguments(arguments, language, is_leading);
+                let document = successful_cli_json(&invocation);
+                assert_eq!(document["data"]["command"], *expected_command);
+                assert!(!document.to_string().contains("operand-must-stay-private"));
+            }
+        }
+    }
+}
+
+fn adrive_utility_describe_arguments<'a>(
+    arguments: &[&'a str],
+    language: Option<&'a str>,
+    is_leading: bool,
+) -> Vec<&'a str> {
+    let mut invocation = vec!["--output", "json"];
+    if is_leading {
+        invocation.push("--describe");
+    }
+    invocation.push("ve-adrive");
+    invocation.extend_from_slice(arguments);
+    if !is_leading {
+        invocation.push("--describe");
+    }
+    if let Some(language) = language {
+        invocation.extend(["--language", language]);
+    }
+    invocation
+}
+
+#[test]
+fn test_share_cancel_confirmation_metadata_matches_doctor_principles() {
+    // [Review Fix #Rebase5] Share cancellation uses --yes; discovery and
+    // doctor must recognize that gate without weakening critical file deletes.
+    let description = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "share",
+        "cancel",
+        "--describe",
+    ]);
+    assert_eq!(description["data"]["destructive"], true);
+    assert_eq!(description["data"]["supports_yes"], true);
+    assert_eq!(description["data"]["supports_force"], false);
+    assert_eq!(description["data"]["supports_dry_run"], true);
+    let doctor = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "doctor",
+        "--check",
+        "principles",
+    ]);
+    let checks = doctor["data"]["checks"].as_array().expect("doctor checks");
+    let principles = checks
+        .iter()
+        .find(|check| check["name"] == "principles")
+        .expect("principles check");
+    assert_eq!(principles["status"], "passed");
+    assert_eq!(
+        principles["details"]["destructive_force_violations"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn test_share_cancel_without_yes_rejects_before_reading_configuration() {
+    // [Review Fix #Rebase5] A malformed config makes premature runtime
+    // construction observable without sending any cancellation request.
+    let directory = isolated_home("share-cancel-confirmation");
+    let config_path = directory.join("invalid-config.toml");
+    fs::write(&config_path, "invalid TOML = [").expect("write invalid config");
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .args(["--output", "json", "--config-path"])
+        .arg(&config_path)
+        .args([
+            "ve-adrive",
+            "share",
+            "cancel",
+            "share-id",
+            "--instance",
+            "inst-id",
+        ])
+        .output()
+        .expect("execute share cancellation guard");
+    assert_eq!(
+        output.status.code(),
+        Some(tos_core::agent::error::ExitCode::ValidationError.as_i32())
+    );
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).expect("error envelope");
+    assert!(error["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("share cancel requires global --yes"));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("unchanged config"),
+        "invalid TOML = ["
+    );
+    fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+#[test]
+fn test_share_confirmation_gate_is_consistent_in_capability_views() {
+    // [Review Fix #Rebase5] Compact and full/tree have different serializers;
+    // only cancellation may advertise --yes as its destructive action gate.
+    for view in ["compact", "full", "tree"] {
+        let document = successful_cli_json(&[
+            "--output",
+            "json",
+            "ve-adrive",
+            "capabilities",
+            "--view",
+            view,
+        ]);
+        let capabilities = document["data"]["capabilities"]
+            .as_array()
+            .expect("capabilities");
+        let yes_commands = capabilities
+            .iter()
+            .filter(|capability| capability["supports_yes"] == true)
+            .map(|capability| capability["command"].as_str().expect("command"))
+            .collect::<Vec<_>>();
+        assert_eq!(yes_commands, vec!["ve-adrive share cancel"], "view={view}");
+        for capability in capabilities.iter().filter(|capability| {
+            capability["command"] == "ve-adrive del" || capability["command"] == "ve-adrive rm"
+        }) {
+            assert_eq!(capability["supports_force"], true);
+            assert_eq!(capability["supports_yes"], false);
+        }
+    }
 }
 
 #[test]
@@ -4701,11 +4851,21 @@ fn test_adrive_capabilities_schema_matches_agent_contract() {
         .get("supports_dry_run")
         .and_then(|value| value.as_bool())
         .is_some()));
-    assert!(capabilities
+    for capability in capabilities
         .iter()
         .filter(|capability| capability["destructive"] == true)
-        .all(|capability| capability["supports_force"] == true
-            && capability["supports_dry_run"] == true));
+    {
+        assert_eq!(capability["supports_dry_run"], true);
+        // [Review Fix #Rebase5] Cancellation uses its approved --yes gate;
+        // retain the force requirement for every other destructive command.
+        if capability["command"] == "ve-adrive share cancel" {
+            assert_eq!(capability["supports_yes"], true);
+            assert_eq!(capability["supports_force"], false);
+            assert_eq!(capability["risk_level"], "high");
+        } else {
+            assert_eq!(capability["supports_force"], true);
+        }
+    }
     // [Review Fix #3] Critical ADrive examples are copied by agents; keep them
     // executable in non-interactive shells by showing the exact confirmation
     // gate alongside --force.
@@ -5450,10 +5610,13 @@ fn test_adrive_skill_export_writes_markdown_skill_pack() {
         .join("SKILL.md");
     let markdown = fs::read_to_string(&skill_path).expect("read exported ve-adrive skill");
     assert!(
-        markdown.starts_with("# ve_adrive_ls"),
+        markdown.starts_with("---\nname: ve-adrive-ls\n"),
         "markdown={markdown}"
     );
-    assert!(markdown.contains("`ve-adrive ls`"), "markdown={markdown}");
+    assert!(
+        markdown.contains("`ve-storage-uni-cli ve-adrive ls`"),
+        "markdown={markdown}"
+    );
     assert!(markdown.contains("```json"), "markdown={markdown}");
     let zh_dir = std::env::temp_dir().join(format!(
         "ve-storage-uni-cli-adrive-skill-export-zh-{}",
@@ -6388,7 +6551,10 @@ fn test_tos_skill_list_and_export_consume_registry() {
     let skill_path = dir.join("tos-transfer").join("ve_tos_cp").join("SKILL.md");
     assert!(skill_path.exists());
     let exported = fs::read_to_string(skill_path).expect("exported skill");
-    assert!(exported.starts_with("# ve_tos_cp"), "exported={exported}");
+    assert!(
+        exported.starts_with("---\nname: ve-tos-cp\n"),
+        "exported={exported}"
+    );
     assert!(exported.contains("```json"), "exported={exported}");
     let _ = fs::remove_dir_all(&dir);
 }

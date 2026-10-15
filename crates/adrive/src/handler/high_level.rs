@@ -92,7 +92,9 @@ const SPACE_TABLE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-const FILE_TABLE_COLUMNS: &[&str] = &["file_path", "size", "file_type", "updated_at", "is_folder"];
+/// Stable file-listing columns shared by ordinary and share receiver tables.
+pub(super) const FILE_TABLE_COLUMNS: &[&str] =
+    &["file_path", "size", "file_type", "updated_at", "is_folder"];
 const ADRIVE_SINGLE_PUT_LIMIT: u64 = 64 * 1024 * 1024;
 const ADRIVE_MULTIPART_PART_SIZE: u64 = 16 * 1024 * 1024;
 const DEFAULT_BATCH_FILE_ROLLOVER_BYTES: u64 = 50 * 1024 * 1024;
@@ -604,7 +606,9 @@ async fn resolve_remote_uri_by_name(
     Ok(format_target(&resolved))
 }
 
-async fn resolve_parsed_target_by_name(
+/// Resolve existing Instance and Space names without altering the selected remote path.
+/// Returns the existing resolver errors and preserves ID compatibility.
+pub(crate) async fn resolve_parsed_target_by_name(
     client: &IdsClient,
     target: ParsedADriveUri,
 ) -> Result<ParsedADriveUri, CliError> {
@@ -648,7 +652,9 @@ async fn resolve_target_parts_by_name(
     Ok(())
 }
 
-async fn resolve_instance_segment_by_name(
+/// Resolve one Instance name using the existing ID-compatible resolver.
+/// Returns service errors other than a name-not-found compatibility fallback.
+pub(crate) async fn resolve_instance_segment_by_name(
     client: &IdsClient,
     instance: &str,
 ) -> Result<String, CliError> {
@@ -5664,7 +5670,9 @@ async fn list_files_bounded(
     })
 }
 
-fn normalize_ls_files_and_folders(
+/// Promote files-array folder markers, skipping self markers and markers already present in folders.
+/// Accepts service files/folders and the selected directory; returns separate display collections without I/O.
+pub(super) fn normalize_ls_files_and_folders(
     files: Vec<FileInfo>,
     folders: Vec<FolderInfo>,
     root_path: &str,
@@ -7531,7 +7539,9 @@ async fn list_files(
     )
 }
 
-fn adrive_ls_folder_entry(folder: &FolderInfo, human_readable: bool) -> Value {
+/// Convert a folder to a display row with zero size and explicit folder type.
+/// Accepts folder metadata and size formatting mode; returns JSON without I/O or errors.
+pub(super) fn adrive_ls_folder_entry(folder: &FolderInfo, human_readable: bool) -> Value {
     json!({
         "file_path": folder.folder,
         "size": adrive_ls_size_value(0, human_readable),
@@ -7541,7 +7551,9 @@ fn adrive_ls_folder_entry(folder: &FolderInfo, human_readable: bool) -> Value {
     })
 }
 
-fn adrive_ls_file_entry(file: &FileInfo, human_readable: bool) -> Value {
+/// Convert a regular file to a display row using nonnegative size and a default file type.
+/// Accepts file metadata and size formatting mode; returns JSON without I/O or errors.
+pub(super) fn adrive_ls_file_entry(file: &FileInfo, human_readable: bool) -> Value {
     let size = adrive_file_size(file);
     json!({
         "file_path": file.file_path,
@@ -8486,43 +8498,32 @@ async fn download_adrive_file_ranges(
     rate_limiter: Option<Arc<RateLimiter>>,
 ) -> Result<usize, CliError> {
     let range_base_path = adrive_range_base_path(destination, source_etag, file_size);
-    let mut ranges = Vec::new();
-    let mut part_number = 1_u32;
-    let mut offset = 0_u64;
-    while offset < file_size {
-        let current_size = (file_size - offset).min(ADRIVE_MULTIPART_PART_SIZE);
-        ranges.push((part_number, offset, current_size));
-        part_number += 1;
-        offset += current_size;
-    }
-    let mut pending_ranges = ranges.clone().into_iter().filter(|(part_number, _, size)| {
-        let part_path = adrive_range_part_path(&range_base_path, *part_number);
-        std::fs::metadata(part_path)
-            .map(|metadata| metadata.len() != *size)
+    let ranges: Vec<_> = super::download_ranges::RangePlan::new(file_size)?
+        .map(|range| (range.number, range.offset, range.size))
+        .collect();
+    let pending = super::download_ranges::RangePlan::new(file_size)?.filter(|range| {
+        std::fs::metadata(adrive_range_part_path(&range_base_path, range.number))
+            .map(|metadata| metadata.len() != range.size)
             .unwrap_or(true)
     });
-    let mut in_flight = FuturesUnordered::new();
-    loop {
-        while in_flight.len() < runtime.multipart_concurrency {
-            let Some((part_number, part_offset, current_size)) = pending_ranges.next() else {
-                break;
-            };
-            let part_path = adrive_range_part_path(&range_base_path, part_number);
-            in_flight.push(download_adrive_range_part(
+    super::download_ranges::run_ranges(pending, runtime.multipart_concurrency, |range| {
+        let part_path = adrive_range_part_path(&range_base_path, range.number);
+        let limiter = rate_limiter.clone();
+        async move {
+            download_adrive_range_part(
                 client,
                 source,
                 source_etag,
-                part_offset,
-                current_size,
+                range.offset,
+                range.size,
                 part_path,
-                rate_limiter.clone(),
-            ));
+                limiter,
+            )
+            .await?;
+            Ok(())
         }
-        let Some(result) = in_flight.next().await else {
-            break;
-        };
-        result?;
-    }
+    })
+    .await?;
     assemble_adrive_range_parts(&range_base_path, destination, &ranges)?;
     cleanup_adrive_range_parts(&range_base_path, &ranges)?;
     Ok(ranges.len())
@@ -8918,7 +8919,7 @@ fn should_use_multipart(
     file_size > ADRIVE_SINGLE_PUT_LIMIT || (checkpoint_enabled && file_size >= checkpoint_threshold)
 }
 
-fn parse_size_bytes(value: &str) -> Option<u64> {
+pub(super) fn parse_size_bytes(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     let digits_len = trimmed
         .chars()
@@ -9190,7 +9191,12 @@ fn output_not_applicable_plan() -> OutputRenderPlan {
     }
 }
 
-fn batch_progress(label: &str, total: u64, progress_enabled: bool) -> Option<ProgressBar> {
+/// Build the shared file/part-count progress style; disabled or empty work returns None.
+pub(crate) fn batch_progress(
+    label: &str,
+    total: u64,
+    progress_enabled: bool,
+) -> Option<ProgressBar> {
     if !progress_enabled || total == 0 {
         return None;
     }
@@ -9243,12 +9249,14 @@ fn traversal_progress(label: &str, target: &str, enabled: bool) -> Option<Progre
     Some(pb)
 }
 
-struct PlanScanProgress {
+/// A scanning indicator cleared on cancellation or unfinished planning.
+pub(crate) struct PlanScanProgress {
     bar: Option<ProgressBar>,
 }
 
 impl PlanScanProgress {
-    fn new(enabled: bool, label: &str, target: &str) -> Self {
+    /// Start an optional scan indicator using a non-sensitive display target.
+    pub(crate) fn new(enabled: bool, label: &str, target: &str) -> Self {
         if !enabled {
             return Self { bar: None };
         }
@@ -9265,7 +9273,8 @@ impl PlanScanProgress {
         Self { bar: Some(bar) }
     }
 
-    fn finish_with_count(&mut self, count: u64, unit: &'static str) {
+    /// Finish scanning with the discovered count and display unit.
+    pub(crate) fn finish_with_count(&mut self, count: u64, unit: &'static str) {
         if let Some(bar) = self.bar.take() {
             bar.finish_with_message(format!("{count} {unit} discovered"));
         }
@@ -10350,6 +10359,8 @@ fn parameter_schema_type(name: &str) -> &'static str {
             | "report-failures-only"
             | "progress"
             | "no-progress"
+            // [Review Fix #17] --checkpoint is a valueless Clap switch.
+            | "checkpoint"
             | "list-echo"
             | "no-list-echo"
             | "human-readable"
@@ -11446,7 +11457,9 @@ mod tests {
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
         };
+        let isolated_config = isolated_share_test_global();
         let global = GlobalArgs {
+            config_path: isolated_config.config_path.clone(),
             credentials_path: Some(credentials_path.clone()),
             ..Default::default()
         };
@@ -11471,7 +11484,9 @@ mod tests {
         let mut group_args = create_args();
         group_args.path = Some("adrive://instance/space".to_string());
         group_args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+        let isolated_config = isolated_share_test_global();
         let unavailable_credentials = GlobalArgs {
+            config_path: isolated_config.config_path.clone(),
             credentials_path: Some(directory.clone()),
             ..Default::default()
         };
@@ -11500,7 +11515,9 @@ mod tests {
         credentials.save_to_path(&credentials_path).unwrap();
         let mut user_args = create_args();
         user_args.path = Some("adrive://instance/space".to_string());
+        let isolated_config = isolated_share_test_global();
         let global = GlobalArgs {
+            config_path: isolated_config.config_path.clone(),
             credentials_path: Some(credentials_path),
             ..Default::default()
         };
@@ -11532,7 +11549,9 @@ mod tests {
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
         };
+        let isolated_config = isolated_share_test_global();
         let global = GlobalArgs {
+            config_path: isolated_config.config_path.clone(),
             credentials_path: Some(directory.clone()),
             ..Default::default()
         };
@@ -11606,7 +11625,9 @@ mod tests {
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
         };
+        let isolated_config = isolated_share_test_global();
         let real_global = GlobalArgs {
+            config_path: isolated_config.config_path.clone(),
             credentials_path: Some(directory.join("missing-credentials.toml")),
             ..Default::default()
         };
@@ -11798,9 +11819,48 @@ mod tests {
         }
     }
 
+    // [Review Fix #ShareTestIsolation1] Unrelated user config must not affect auth-mode contract fixtures.
+    struct IsolatedShareTestGlobal(GlobalArgs);
+    impl std::ops::Deref for IsolatedShareTestGlobal {
+        type Target = GlobalArgs;
+        fn deref(&self) -> &GlobalArgs {
+            &self.0
+        }
+    }
+    impl Drop for IsolatedShareTestGlobal {
+        fn drop(&mut self) {
+            // [Review Fix #ShareTestCleanup1] Keep the isolated config alive for its test scope and remove it even when the test unwinds.
+            if let Some(path) = &self.0.config_path {
+                if let Err(error) = std::fs::remove_file(path) {
+                    eprintln!("failed to remove isolated test config: {error}");
+                }
+            }
+        }
+    }
+    fn isolated_share_test_global() -> IsolatedShareTestGlobal {
+        let config_path =
+            std::env::temp_dir().join(format!("adrive-test-config-{}.toml", ulid::Ulid::new()));
+        std::fs::write(&config_path, "").unwrap();
+        IsolatedShareTestGlobal(GlobalArgs {
+            config_path: Some(config_path),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn isolated_share_config_is_removed_when_its_owner_drops() {
+        let config_path;
+        {
+            let global = isolated_share_test_global();
+            config_path = global.config_path.clone().unwrap();
+            assert!(config_path.exists());
+        }
+        assert!(!config_path.exists());
+    }
+
     #[tokio::test]
     async fn dry_run_space_listing_reuses_real_owner_validation() {
-        let global = GlobalArgs::default();
+        let global = isolated_share_test_global();
         let aksk_auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Aksk),
         };
@@ -11828,7 +11888,7 @@ mod tests {
 
     #[tokio::test]
     async fn unified_dry_run_create_uses_aksk_business_semantics() {
-        let global = GlobalArgs::default();
+        let global = isolated_share_test_global();
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Unified),
         };
@@ -11845,7 +11905,7 @@ mod tests {
 
     #[tokio::test]
     async fn unified_dry_run_list_uses_all_instance_scope() {
-        let global = GlobalArgs::default();
+        let global = isolated_share_test_global();
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Unified),
         };
@@ -11859,7 +11919,7 @@ mod tests {
 
     #[tokio::test]
     async fn unified_dry_run_stat_no_longer_returns_pending() {
-        let global = GlobalArgs::default();
+        let global = isolated_share_test_global();
         let auth = ADriveAuthArgs {
             auth_mode: Some(crate::domain::auth::AuthMode::Unified),
         };

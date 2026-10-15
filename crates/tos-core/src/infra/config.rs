@@ -264,6 +264,9 @@ pub struct TosTableOverride {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdriveOverride {
+    /// Safe share-page origin, independent of the API endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,7 +441,18 @@ impl Profile {
 
     /// 从 ByteCloud TOS 专属环境变量构建 Profile。
     pub fn from_byte_tos_env() -> Self {
-        let mut profile = Self::from_env_with_prefix("BYTE_TOS", true);
+        Self::from_byte_tos_env_with_credentials(true)
+    }
+
+    /// Build the BYTE_TOS environment profile without reading AKSK variables.
+    ///
+    /// Returns network, PSM, and runtime settings; credential fields are unset.
+    pub fn from_byte_tos_env_without_credentials() -> Self {
+        Self::from_byte_tos_env_with_credentials(false)
+    }
+
+    fn from_byte_tos_env_with_credentials(include_credentials: bool) -> Self {
+        let mut profile = Self::from_env_with_prefix("BYTE_TOS", include_credentials);
         // [Review Fix #1] Blank BYTE_TOS_PSM must not activate IDC/cluster/addr_family.
         profile.psm = env_var("BYTE_TOS", "PSM").filter(|value| !value.trim().is_empty());
         if profile.psm.is_some() {
@@ -634,6 +648,15 @@ pub enum FieldSource {
     /// 来自独立的 credentials.toml。
     #[serde(rename = "credentials_file")]
     CredentialsFile,
+    /// Selected by an explicit command-line option.
+    #[serde(rename = "command_line")]
+    CommandLine,
+    /// Selected by an environment variable.
+    #[serde(rename = "environment")]
+    Environment,
+    /// Selected by the compatibility default.
+    #[serde(rename = "compatibility_default")]
+    CompatibilityDefault,
     /// 未配置。
     Unset,
 }
@@ -646,6 +669,9 @@ impl FieldSource {
             FieldSource::BinaryOverride => format!("[{}.{}]", profile_name, binary),
             FieldSource::Derived => "derived from endpoint".to_string(),
             FieldSource::CredentialsFile => "credentials_file".to_string(),
+            FieldSource::CommandLine => "command_line".to_string(),
+            FieldSource::Environment => "environment".to_string(),
+            FieldSource::CompatibilityDefault => "compatibility_default".to_string(),
             FieldSource::Unset => "-".to_string(),
         }
     }
@@ -687,6 +713,9 @@ impl<T: Clone + Serialize> TracedField<T> {
 /// 某个 profile 在某个 binary 视角下的生效配置 + 来源溯源。
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveProfile {
+    /// ADrive-only share-page origin with its configuration source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_base_url: Option<TracedField<String>>,
     pub profile_name: String,
     pub binary: String,
     pub region: TracedField<String>,
@@ -896,26 +925,7 @@ impl ConfigFile {
                 path.display()
             ))
         })?;
-        config.validate_tos_auth_mode_absent()?;
         Ok(config)
-    }
-
-    fn validate_tos_auth_mode_absent(&self) -> Result<(), CliError> {
-        // [Review Fix #5] The tos namespace ban is structural and global, while
-        // supported-mode values are validated only for the selected profile.
-        for (profile_name, profile) in &self.profiles {
-            if profile
-                .tos
-                .as_ref()
-                .and_then(|tos_override| tos_override.auth_mode.as_ref())
-                .is_some()
-            {
-                return Err(CliError::ValidationError(format!(
-                    "auth_mode is not supported in [{profile_name}.tos]; use [{profile_name}.ve-tos]"
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// 将当前 ConfigFile 持久化到默认路径；敏感字段若为明文自动加密为 `ENC:...`。
@@ -1059,6 +1069,7 @@ impl ConfigFile {
             TracedField::shared(strip_placeholder(profile.security_token.clone()));
 
         let mut auth_endpoint: Option<TracedField<String>> = None;
+        let mut share_base_url: Option<TracedField<String>> = None;
         let mut account_id: Option<TracedField<String>> = None;
         let mut default_instance: Option<TracedField<String>> = None;
         let mut default_space: Option<TracedField<String>> = None;
@@ -1073,10 +1084,10 @@ impl ConfigFile {
                 } else {
                     profile.ve_tos.as_ref()
                 };
-                if binary == Binary::VeTos {
+                {
                     let configured_auth_mode = tos_override
                         .and_then(|tos_override| tos_override.auth_mode.as_deref())
-                        .map(normalize_ve_tos_auth_mode)
+                        .map(|value| normalize_tos_auth_mode(value, binary == Binary::VeTos))
                         .transpose()?;
                     auth_mode = Some(TracedField {
                         source: if configured_auth_mode.is_some() {
@@ -1188,6 +1199,15 @@ impl ConfigFile {
                             FieldSource::Unset
                         },
                         value: configured_auth_mode,
+                    });
+                    // [Review Fix #ShareOrigin2] Resolving metadata must not validate a page origin unused by this operation.
+                    share_base_url = Some(TracedField {
+                        value: o.share_base_url.clone(),
+                        source: if o.share_base_url.is_some() {
+                            FieldSource::BinaryOverride
+                        } else {
+                            FieldSource::Unset
+                        },
                     });
                     region = TracedField::override_with(region, o.region.clone());
                     endpoint = TracedField::override_with(endpoint, o.endpoint.clone());
@@ -1371,6 +1391,7 @@ impl ConfigFile {
             region,
             endpoint,
             auth_endpoint,
+            share_base_url,
             psm,
             idc,
             cluster,
@@ -1809,17 +1830,10 @@ fn set_tos_override(
     o: &mut TosOverride,
     key: &str,
     value: &str,
-    supports_auth_mode: bool,
+    is_ve_tos: bool,
 ) -> Result<(), CliError> {
     match canonical_config_key(key) {
-        "auth_mode" if supports_auth_mode => {
-            o.auth_mode = Some(normalize_ve_tos_auth_mode(value)?);
-        }
-        "auth_mode" => {
-            return Err(CliError::ValidationError(
-                "auth_mode is not supported by tos; use the ve-tos config namespace".to_string(),
-            ));
-        }
+        "auth_mode" => o.auth_mode = Some(normalize_tos_auth_mode(value, is_ve_tos)?),
         "region" => o.region = Some(value.into()),
         "endpoint" => o.endpoint = Some(value.into()),
         "psm" => o.psm = Some(value.into()),
@@ -1905,6 +1919,10 @@ fn set_tostable_override(o: &mut TosTableOverride, key: &str, value: &str) -> Re
 
 fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result<(), CliError> {
     match canonical_config_key(key) {
+        "share_base_url" => {
+            validate_share_base_url(value)?;
+            o.share_base_url = Some(value.into());
+        }
         "auth_mode" => {
             o.auth_mode = Some(normalize_adrive_auth_mode(value)?);
         }
@@ -1941,6 +1959,15 @@ fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result
         }
     }
     Ok(())
+}
+
+fn normalize_tos_auth_mode(value: &str, is_ve_tos: bool) -> Result<String, CliError> {
+    if is_ve_tos {
+        normalize_ve_tos_auth_mode(value)
+    } else {
+        crate::infra::byte_tos_auth::ByteTosAuthMode::parse(value, "profile config")
+            .map(|mode| mode.as_str().to_string())
+    }
 }
 
 fn normalize_ve_tos_auth_mode(value: &str) -> Result<String, CliError> {
@@ -2077,6 +2104,45 @@ mod tests {
     }
 
     #[test]
+    fn byte_tos_non_secret_env_retains_psm_and_network_fields() {
+        let _lock = PROFILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let settings = [
+            ("BYTE_TOS_PSM", "test.psm"),
+            ("BYTE_TOS_IDC", "test-idc"),
+            ("BYTE_TOS_CLUSTER", "test-cluster"),
+            ("BYTE_TOS_ADDR_FAMILY", "ipv6"),
+            ("BYTE_TOS_REGION", "cn-test"),
+            ("BYTE_TOS_ENDPOINT", "https://test.example"),
+            ("BYTE_TOS_ACCESS_KEY", "unused"),
+            ("BYTE_TOS_SECRET_KEY", "unused"),
+            ("BYTE_TOS_SECURITY_TOKEN", "unused"),
+        ];
+        let names = settings.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let _restore = EnvironmentRestore::capture(&names);
+        for (name, value) in settings {
+            std::env::set_var(name, value);
+        }
+        let profile = Profile::from_byte_tos_env_without_credentials();
+        assert_eq!(profile.psm.as_deref(), Some("test.psm"));
+        assert_eq!(profile.idc.as_deref(), Some("test-idc"));
+        assert_eq!(profile.cluster.as_deref(), Some("test-cluster"));
+        assert_eq!(profile.addr_family.as_deref(), Some("ipv6"));
+        assert_eq!(profile.region.as_deref(), Some("cn-test"));
+        assert_eq!(profile.endpoint.as_deref(), Some("https://test.example"));
+        assert!(profile.access_key_id.is_none());
+        assert!(profile.secret_access_key.is_none());
+        assert!(profile.security_token.is_none());
+        std::env::set_var("BYTE_TOS_PSM", "   ");
+        let blank_psm = Profile::from_byte_tos_env_without_credentials();
+        assert!(blank_psm.psm.is_none());
+        assert!(blank_psm.idc.is_none());
+        assert!(blank_psm.cluster.is_none());
+        assert!(blank_psm.addr_family.is_none());
+    }
+
+    #[test]
     fn no_credentials_effective_profile_retains_resources_without_decrypting() {
         let directory = std::env::temp_dir().join(format!(
             "ve-tos-non-secret-profile-{}-{}",
@@ -2182,37 +2248,39 @@ mod tests {
     }
 
     #[test]
-    fn tos_auth_mode_setter_is_rejected() {
+    fn tos_auth_mode_setter_normalizes_and_rejects_foreign_modes() {
         let mut config = ConfigFile::default();
-
-        let error = config
-            .set_by_path(&["default", "tos", "auth_mode"], "unified")
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Validation error: auth_mode is not supported by tos; use the ve-tos config namespace"
-        );
+        config
+            .set_by_path(&["default", "tos", "auth_mode"], " ZTI ")
+            .unwrap();
+        let effective = config
+            .get_effective_profile("default", Binary::Tos)
+            .unwrap();
+        let mode = effective.auth_mode.unwrap();
+        assert_eq!(mode.value.as_deref(), Some("zti"));
+        assert_eq!(mode.source, FieldSource::BinaryOverride);
+        for invalid in ["unified", "oauth", ""] {
+            assert!(config
+                .set_by_path(&["default", "tos", "auth_mode"], invalid)
+                .is_err());
+        }
     }
 
     #[test]
-    fn handwritten_tos_auth_mode_is_rejected_after_deserialization() {
-        let directory = std::env::temp_dir().join(format!(
-            "tos-config-auth-mode-{}-{}",
-            std::process::id(),
-            ulid::Ulid::new()
-        ));
+    fn invalid_tos_auth_mode_only_blocks_selected_namespace() {
+        let directory = std::env::temp_dir().join(format!("tos-config-auth-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
-        std::fs::write(&path, "[default.tos]\nauth_mode = \"unified\"\n").unwrap();
-
-        let error = ConfigFile::load_from(&path).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Validation error: auth_mode is not supported in [default.tos]; use [default.ve-tos]"
-        );
-        let _ = std::fs::remove_dir_all(directory);
+        std::fs::write(&path, "[other]\nregion = \"cn-test\"\n[default.ve-tos]\nauth_mode = \"aksk\"\n[default.tos]\nauth_mode = \"unified\"\n").unwrap();
+        let config = ConfigFile::load_from(&path).unwrap();
+        assert!(config
+            .get_effective_profile("default", Binary::Tos)
+            .is_err());
+        assert!(config
+            .get_effective_profile("default", Binary::VeTos)
+            .is_ok());
+        assert!(config.get_effective_profile("other", Binary::Tos).is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2323,7 +2391,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tos.endpoint.value.as_deref(), Some("byte-tos-endpoint"));
-        assert!(tos.auth_mode.is_none());
+        assert!(tos.auth_mode.unwrap().value.is_none());
         assert_eq!(ve_tos.endpoint.value.as_deref(), Some("ve-tos-endpoint"));
         assert_eq!(
             ve_tos.auth_mode.and_then(|field| field.value).as_deref(),
@@ -2613,4 +2681,37 @@ mod tests {
             assert!(is_sensitive_field(field), "field={field}");
         }
     }
+}
+
+/// Validate an HTTP(S) share-page origin, preserving its configured scheme and port.
+/// Returns a sanitized validation error without echoing URL credentials or queries.
+pub fn validate_share_base_url(origin: &str) -> Result<(), CliError> {
+    let invalid =
+        || CliError::ValidationError("share_base_url must be a safe HTTP(S) origin".into());
+    let parsed = url::Url::parse(origin).map_err(|_| invalid())?;
+    // [Review Fix #ShareProtocol3] Explicit page configuration supports HTTP and HTTPS without a host-specific protocol policy.
+    let raw_authority = origin
+        .split_once("://")
+        // [Review Fix #ShareProtocol4] Match the leading raw scheme so a delimiter inside a path cannot bypass origin validation.
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(parsed.scheme()))
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .ok_or_else(invalid)?;
+    let raw_path = origin
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|position| &rest[position..]));
+    if origin.trim() != origin
+        || origin.contains('\\')
+        || origin.chars().any(char::is_control)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || raw_authority.contains('@')
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(raw_path, None | Some("/"))
+        || parsed.host_str().is_none()
+        || !matches!(parsed.scheme(), "https" | "http")
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }

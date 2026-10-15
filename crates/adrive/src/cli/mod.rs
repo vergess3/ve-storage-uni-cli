@@ -17,6 +17,7 @@
 pub mod auth;
 pub mod high_level;
 pub mod meta;
+pub mod share;
 
 use clap::Subcommand;
 
@@ -53,6 +54,9 @@ pub enum ADriveCommand {
     Put(high_level::PutArgs),
     /// Create a folder
     Mkdir(high_level::MkdirArgs),
+
+    /// Manage and receive share links
+    Share(share::ShareCommand),
 
     // ─── Meta / Utilities ───────────────────────────────────
     /// Discover CLI capabilities
@@ -95,6 +99,13 @@ pub fn command_path(command: &ADriveCommand) -> String {
         ADriveCommand::Cat(_) => "cat",
         ADriveCommand::Put(_) => "put",
         ADriveCommand::Mkdir(_) => "mkdir",
+        ADriveCommand::Share(group) => {
+            return group
+                .action
+                .as_ref()
+                .map(|action| format!("ve-adrive share {}", action.name()))
+                .unwrap_or_else(|| "ve-adrive share".into())
+        }
         // Meta
         ADriveCommand::Capabilities(_) => "capabilities",
         ADriveCommand::Api(args) => return format!("ve-adrive api {} {}", args.group, args.action),
@@ -165,6 +176,17 @@ High-Level Commands:
   find          Find files by name, size, or mtime
   cat           Stream file content
   put           Upload stdin to a file
+
+Share Links:
+  share create  Create a share link
+  share get     Get a share link
+  share list    List share links
+  share update  Update share settings
+  share cancel  Cancel a share link
+  share inspect Inspect share info
+  share files   List shared files
+  share view    Preview one shared file
+  share download Download shared files
 
 Capabilities / Utilities:
   capabilities  Discover CLI capabilities
