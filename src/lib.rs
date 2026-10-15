@@ -71,6 +71,8 @@ enum ToolCommand {
     /// ByteCloud TOS commands (high-level + utilities)
     #[command(name = "tos")]
     TosCli {
+        #[command(flatten)]
+        auth: tos_cli::cli::auth::ByteTosAuthArgs,
         #[command(subcommand)]
         command: tos_cli::TosCliCommand,
     },
@@ -100,6 +102,30 @@ mod auth_mode_parser_tests {
     use super::{Cli, ToolCommand};
     use clap::Parser;
     use ve_tos_cli::domain::auth::AuthMode;
+
+    #[test]
+    fn tos_auth_mode_accepts_only_aksk_and_zti_before_or_after_command() {
+        for mode in ["aksk", "zti"] {
+            for arguments in [
+                vec!["ve-storage-uni-cli", "tos", "--auth-mode", mode, "ls"],
+                vec!["ve-storage-uni-cli", "tos", "ls", "--auth-mode", mode],
+            ] {
+                assert!(
+                    Cli::try_parse_from(arguments).is_ok(),
+                    "tos must accept {mode}"
+                );
+            }
+        }
+        for tool in ["ve-tos", "ve-adrive"] {
+            assert!(
+                Cli::try_parse_from(["ve-storage-uni-cli", tool, "--auth-mode", "zti", "ls"])
+                    .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["ve-storage-uni-cli", "--auth-mode", "zti", "tos", "ls"]).is_err()
+        );
+    }
 
     #[test]
     fn ve_tos_auth_mode_is_tool_scoped() {
@@ -151,7 +177,9 @@ mod auth_mode_parser_tests {
         assert!(adrive_help.contains("ve logout"));
 
         let tos_help = byted_tos_grouped_help_zh();
-        assert!(!tos_help.contains("--auth-mode"));
+        assert!(tos_help.contains("--auth-mode <MODE>"));
+        assert!(tos_help.contains("BYTETOS_AUTH_MODE"));
+        assert!(tos_help.contains("aksk") && tos_help.contains("zti"));
         assert!(!tos_help.to_ascii_lowercase().contains("unified"));
     }
 }
@@ -172,6 +200,25 @@ fn normalize_help_aliases(args: &[String]) -> Vec<String> {
         return normalized;
     }
     args.to_vec()
+}
+
+fn normalize_bare_adrive_share_help(arguments: &[String]) -> Vec<String> {
+    if !is_adrive_invocation(arguments)
+        || !arguments.iter().any(|argument| argument == "share")
+        || is_help_request(arguments)
+        || has_flag(arguments, "--describe")
+    {
+        return arguments.to_vec();
+    }
+    let sanitized = args_without_help_language(arguments);
+    let is_bare_share = matches!(Cli::try_parse_from(&sanitized),Ok(Cli {tool:ToolCommand::ADrive {command:ve_adrive_cli::ADriveCommand::Share(ref group),..},..}) if group.action.is_none());
+    if !is_bare_share {
+        return arguments.to_vec();
+    }
+    // [Review Fix #ShareHelp2] Bare groups use the same language-aware, contextual help path as --help.
+    let mut help_arguments = arguments.to_vec();
+    help_arguments.push("--help".into());
+    help_arguments
 }
 
 fn normalize_leading_help_flag(args: &[String]) -> Vec<String> {
@@ -383,6 +430,12 @@ fn display_help_text_for_args(effective_args: &[String]) -> Result<String, clap:
 
 fn localize_clap_help_zh(help: &str) -> String {
     let localized = translate_help_phrases_zh(&help)
+        // [Review Fix #18] ByteTOS narrows the shared clap enum after help
+        // rendering, so translate its surface-specific description here.
+        .replace(
+            "Recursive listing mode: hierarchical only",
+            "递归列举模式：仅支持 hierarchical",
+        )
         .replace("Usage:", "用法:")
         .replace("Arguments:", "参数:")
         .replace("Options:", "选项:")
@@ -463,6 +516,101 @@ fn help_translations_zh_longest_first() -> &'static [(&'static str, &'static str
 }
 
 const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #Rebase1] Keep both ByteTOS/ZTI and share help when rebasing onto master.
+    // [Review Fix #21] Keep ByteTOS-specific config and doctor help localized
+    // after their parser metadata stopped inheriting the ve-tos wording.
+    ("Inspect and modify ByteTOS CLI configuration", "查看和修改 ByteTOS CLI 配置"),
+    ("Inspect and modify ByteTOS CLI configuration stored in ~/.tos/config.toml.", "查看和修改存储在 ~/.tos/config.toml 中的 ByteTOS CLI 配置。"),
+    ("Initialize the selected profile without setting network defaults", "初始化所选 Profile，不设置网络默认值"),
+    ("Profile name to initialize (defaults to default)", "要初始化的 Profile 名称（默认为 default）"),
+    ("Show current configuration with secrets redacted", "显示当前配置并脱敏密钥"),
+    ("Set a ByteTOS configuration value", "设置 ByteTOS 配置值"),
+    ("Configuration key, for example region, endpoint, or staging.tos.psm", "配置键，例如 region、endpoint 或 staging.tos.psm"),
+    ("Check one module: auth, config, registry, network (or endpoint), mcp, or completion", "检查一个模块：auth、config、registry、network（或 endpoint）、mcp 或 completion"),
+    ("Kept for compatibility with existing invocations; ByteTOS doctor has no permission probe", "为兼容旧调用而保留；ByteTOS doctor 不提供权限探测"),
+    ("Probe the configured TOS endpoint; off by default to keep doctor offline", "探测已配置的 TOS endpoint；默认关闭以保持 doctor 离线运行"),
+    ("Timeout in milliseconds for --live-network", "--live-network 的超时时间（毫秒）"),
+    ("Common KEY values:", "常用 KEY 值："),
+    // [Review Fix #25] Keep the translated init hint aligned with the PSM
+    // path, which can make requests without an explicit endpoint.
+    ("Creates shared and [profile.tos] sections. Configure an endpoint (and region if it cannot be inferred), or PSM service discovery, before making requests.", "创建共享 section 和 [profile.tos] section。发起请求前请配置 endpoint（无法推导时还需配置 region），或配置 PSM 服务发现。"),
+    ("Shows effective values with source annotations such as [default], [default.tos], env, and cli.", "显示有效值及其来源标注，例如 [default]、[default.tos]、env 和 cli。"),
+    ("KEY may also name a profile, for example staging.region or staging.tos.psm.", "KEY 也可指定 Profile，例如 staging.region 或 staging.tos.psm。"),
+    ("region                         -> [active-profile]", "region                         -> 写入 [active-profile]"),
+    ("endpoint / psm / idc / cluster / addr_family -> [active-profile.tos]", "endpoint / psm / idc / cluster / addr_family -> 写入 [active-profile.tos]"),
+    ("auth_mode (aksk or zti)        -> [active-profile.tos]", "auth_mode（aksk 或 zti）        -> [active-profile.tos]"),
+    ("access_key_id / secret_access_key / security_token -> active tos credentials", "access_key_id / secret_access_key / security_token -> 当前 tos 凭证"),
+    ("checkpoint_dir / progress_enabled / max_retry_count -> [active-profile.tos]", "checkpoint_dir / progress_enabled / max_retry_count -> 写入 [active-profile.tos]"),
+    ("Path to config TOML", "配置 TOML 路径"),
+    ("Path to credentials TOML", "凭据 TOML 路径"),
+    ("Confirm share cancellation", "确认分享取消操作"),
+    ("Share Links:", "分享链接："),
+
+    // [Review Fix #LiveDocs1] Keep approved page/API mapping, local-root and rejection rules visible in Chinese help/Describe.
+    ("Standard IDS hosts map between idsapi/idsapp and idsapi-boe/idsapp-boe under volces.com, preserving the Instance label, scheme and port. Share pages, receiver APIs and download addresses support HTTP and HTTPS without protocol upgrades. Override custom page origins with --share-base-url and receiver API origins with --endpoint. Anonymous receivers derive APIs from page URLs without account config; explicit OAuth uses the selected profile API or --endpoint.", "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-base-url，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
+    ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths still reject symlinks/reparse points. Resume compares resolved roots. Explicit service denials such as 403 retain their error code and set IssuanceOutcomeUnknown=false; ambiguous URL issuance is never automatically replayed. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Preflight can create directory scaffolding before a later transfer denial. The default download table shows a cp-style summary (total/succeeded/failed/skipped/pending), including empty results; JSON and explicit queries retain file details. Summary.Skipped counts validated completed files reused during resume and is included in Summary.Completed. Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring a checkpoint; files without either identity use one streamed GET to avoid mixing versions; --checkpoint-threshold changes the threshold and --multipart-concurrency changes the default 4 concurrent ranges. Range retries reuse the same issued URL; completed-file resume remains file-level. Scanning and file-count progress use stderr, with per-file range completion shown during large-file transfers; enabled on TTY by default; --progress forces progress, while --no-progress or --quiet disables it. --progress and --no-progress are mutually exclusive. Forbidden.ShareDownloadDisabled requires the share owner to enable --permission download.", "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点。恢复时比较解析后的根目录。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 需要分享者开启 --permission download。"),
+
+    // [Review Fix #ShareTrailingSlash3] Root and dedicated help share this full phrase; translate the new URL rule without an English fallback.
+    ("inspect/files/view/download default to anonymous even if a profile configures OAuth. Explicit --auth-mode oauth reuses --profile via auth login/status and existing token refresh; it never starts login or falls back to another identity. OAuth authenticates share info/token exchange; file APIs use only x-share-token and content downloads carry no account credentials. Login and share permissions are validated by the service; passwords are still required when configured. Public URLs accept /share/<id> or /share/<id>/; one trailing slash is normalized away. Select directory prefixes with --path, not additional URL segments.", "inspect/files/view/download 默认匿名，即使 profile 配置了 OAuth。显式 --auth-mode oauth 通过 auth login/status 复用 --profile 和现有 token 刷新机制；不会自动登录或回退到其他身份。OAuth 用于分享概况及 token 交换；文件 API 仅使用 x-share-token，内容下载不携带账户凭据。服务端验证登录和分享权限；设置了提取码时仍须提供。公开 URL 支持 /share/<id> 和 /share/<id>/，末尾一个斜杠会被规范化移除。目录前缀通过 --path 指定，不追加到 URL 路径。"),
+    ("files returns one directory page: --limit sets its size and --marker uses the previous NextMarker; stop when IsTruncated=false. Exact file paths select one file; directory paths end in /. Each invocation needs the extraction code when configured: stdin > URL pwd > hidden ordinary-TTY prompt. --password-stdin reads to EOF (use a pipe); passwords are not saved. Download enumerates pages automatically. For files, default table/CSV uses the same file_path, size, file_type, updated_at and is_folder columns as ls, with folders first. The table Total counts displayed rows; JSON and explicit --query retain the raw service arrays.", "files 返回一页目录：--limit 设置条数，--marker 使用上一页的 NextMarker；IsTruncated=false 时结束。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。Download 自动枚举各页。files 的默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。表格 Total 为展示行数；JSON 和显式 --query 保留服务原始数组。"),
+    ("Manage and receive share links", "管理和接收分享链接"),
+    ("Create a share link", "创建分享链接"),
+    ("Get a share link", "获取分享链接"),
+    ("List share links", "列举分享链接"),
+    ("Update share settings", "更新分享设置"),
+    ("Cancel a share link", "取消分享链接"),
+    ("Inspect share info", "查看分享信息"),
+    ("List shared files", "列举分享文件"),
+    ("view previews one exact file; a single shared file is selected when --path is omitted. Folders and multiple roots require --path to a file. Default auto mode returns a short-lived PDF PreviewURL for supported documents, or raw content metadata for other files; it never opens a browser. --raw streams original bytes to a pipe or redirected stdout (for example | less), rejects terminal stdout and conflicts with --output/--query. Preview requests consume PreviewLimit and are never automatically retried. Document URLs are temporary capabilities; keep them private. Unsupported deployments can return 404. Password precedence is stdin > URL pwd > hidden TTY prompt; --password-stdin reads to EOF.", "view 预览一个精确文件；省略 --path 时自动选择唯一的分享文件。文件夹或多个根条目需要 --path 指定文件。默认 auto 为支持的文档返回短期 PDF PreviewURL，其他文件返回原始内容元数据；不会打开浏览器。--raw 将原始字节输出到管道或重定向的 stdout（例如 | less），拒绝终端 stdout，且与 --output/--query 冲突。预览请求消耗 PreviewLimit，绝不自动重试。文档 URL 是临时访问凭证，请保密。不支持该能力的部署可能返回 404。密码优先级为 stdin > URL pwd > 终端隐藏提示；--password-stdin 读取至 EOF。"),
+    ("Preview one shared file", "预览一个分享文件"),
+    ("Exact file path; omitted selects a single shared file", "精确文件路径；省略时自动选择唯一的分享文件"),
+    ("Stream original bytes to a pipe or redirected stdout", "将原始字节输出到管道或重定向的标准输出"),
+    ("Download shared files", "下载分享文件"),
+    ("Share name", "分享名称"),
+    ("Share description", "分享描述"),
+    ("Share permission: view or download", "分享权限：view 或 download"),
+    ("Share lifetime duration; 0 means never expires", "分享有效时长；0 表示永不过期"),
+    ("Read one share password from stdin (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取一个分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    ("Create defaults to view (preview only); use --permission download to allow downloads. Update preserves omitted settings. SharePwd and RequireLogin are server fields: --password-stdin sets a share password in create/update and supplies it in files/view/download. RequireLogin controls receiver login; management uses the selected account. Receivers default to anonymous; explicit --auth-mode oauth uses the selected recipient profile.", "创建默认 view（仅预览）；允许下载时显式使用 --permission download。更新时未传的设置保持不变。SharePwd 和 RequireLogin 是服务端字段：create/update 的 --password-stdin 设置分享密码，files/view/download 用它提供提取码。RequireLogin 控制接收者登录；管理使用当前账户。接收默认匿名；显式 --auth-mode oauth 使用所选接收者 profile。"),
+    // [Review Fix #Download7] The unified CLI owns a separate help catalog from ADrive metadata.
+    ("Read the receiver password from stdin; it does not change the share password (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取接收密码；不会修改分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    ("Read the receiver password from stdin; does not change the share password (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取接收密码；不会修改分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    ("Require receiver login; accepts explicit true or false", "要求接收者登录；显式接受 true 或 false"),
+    ("Maximum preview count; 0 means unlimited", "最大预览次数；0 表示无限制"),
+    ("Maximum download count; 0 means unlimited", "最大下载次数；0 表示无限制"),
+    ("ADrive file or folder target", "ADrive 文件或文件夹目标"),
+    ("Share page origin override", "分享页面源地址覆盖值"),
+    ("Share identifier", "分享标识符"),
+    ("Share identifier or adrive://instance/share-id", "分享标识符或 adrive://instance/share-id"),
+    ("Treat the share target instance as a name and resolve it to an ID", "将分享目标中的实例视为名称并解析为 ID"),
+    ("ADrive instance identifier; required for a bare ShareID, optional for a share URI", "ADrive 实例标识符；仅传 ShareID 时必填，分享 URI 已带实例时可省略"),
+    ("ADrive instance target: adrive://instance", "ADrive 实例目标：adrive://instance"),
+    ("ADrive instance identifier; required unless an instance URI is supplied", "ADrive 实例标识符；未传实例 URI 时必填"),
+    ("list accepts adrive://instance (with an optional root slash) or --instance instance. A repeated --instance must match the URI; --by-name resolves the instance name. The instance URI has no share/space/file path and decodes once. List returns one page; --creator is optional only when OAuth supplies a bound user_id.", "list 接受 adrive://instance（可带根目录斜杠），或 --instance instance。重复指定的 --instance 必须与 URI 一致；--by-name 解析实例名称。实例 URI 不含分享/空间/文件路径，且仅解码一次。List 返回一页；仅当 OAuth 提供绑定的 user_id 时可省略 --creator。"),
+    ("get/update/cancel accept adrive://instance/share-id or a bare ShareID with --instance. A repeated --instance must match the URI; --by-name resolves only the instance. Share URIs use one ShareID segment and decode components once; file/space targets are interpreted by their own command context.", "get/update/cancel 接受 adrive://instance/share-id，或 ShareID 加 --instance。重复指定的 --instance 必须与 URI 一致；--by-name 仅解析实例名称。分享 URI 的 ShareID 为一个路径段，组件仅解码一次；文件/空间目标由其命令上下文解析。"),
+    ("Creator user identifier; repeat for multiple creators", "创建者用户标识符；多个创建者可重复使用"),
+    ("Share lifecycle status", "分享生命周期状态"),
+    ("Creation time range start in RFC3339", "RFC3339 格式的创建时间范围起点"),
+    ("Creation time range end in RFC3339", "RFC3339 格式的创建时间范围终点"),
+    ("Search offset, at most 10000", "搜索偏移量，最大 10000"),
+    ("Maximum entries in this page", "本页最大条目数"),
+    ("Optimistic concurrency timestamp; omitted fetches the current value", "乐观并发时间戳；省略时获取当前值"),
+    ("Public share URL (one optional trailing slash); optional pwd query is kept secret", "公开分享 URL（末尾可带一个斜杠）；可选 pwd 查询参数保密处理"),
+    ("Exact file path or directory path ending in slash", "精确文件路径或以斜杠结尾的目录路径"),
+    ("Destination directory for shared files", "分享文件的目标目录"),
+    ("Recursively download selected folders", "递归下载选定文件夹"),
+    ("Overwrite existing destination files", "覆盖已存在的目标文件"),
+    ("Checkpoint file for file-level resume", "文件级续传使用的 checkpoint 文件"),
+    ("Automatically range-download files at this size (default 20MB), even without a checkpoint", "自动启用 Range 下载的文件大小阈值，默认 20MB，无需 checkpoint"),
+    ("Maximum ranges transferred concurrently for one file (default 4)", "单文件的最大 Range 并发数，默认 4"),
+    ("Resume using the checkpoint file", "使用 checkpoint 文件续传"),
+    ("Share password supplied through child stdin", "通过子进程标准输入提供的分享密码"),
+    ("Share password returned for authorized delivery", "为授权交付返回的分享密码"),
+    ("Share settings are mutable; the shared target cannot change.", "分享设置可修改；分享目标不可更改。"),
+    ("Anonymous receiver access never loads account credentials.", "匿名接收访问不加载账户凭据。"),
+
+    ("Exact skill name or canonical command, e.g. tos_cp or \"tos cp\"", "精确的 Skill 名称或规范命令，例如 tos_cp 或 \"tos cp\""),
+    ("Skill name, canonical command, or command suffix, e.g. ve_tos_cp or cp", "Skill 名称、规范命令或命令后缀，例如 ve_tos_cp 或 cp"),
     // [Review Fix #9] Preserve each aligned root invocation verbatim while
     // translating its separately audited human-facing service description.
     (
@@ -638,6 +786,12 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Authentication mode for this invocation: aksk, oauth, or unified. Precedence is --auth-mode <MODE>, profile auth_mode, ADRIVE_AUTH_MODE, then aksk. Unified selects the same-name externally managed profile, ignores local AK/SK and OAuth credentials, and uses `ve login` / `ve logout`.",
         "本次调用的鉴权模式：aksk、oauth 或 unified。优先级为 --auth-mode <MODE>、profile auth_mode、ADRIVE_AUTH_MODE，最后为 aksk。Unified 使用同名的外部托管 profile，忽略本地 AK/SK 和 OAuth 凭证，并使用 `ve login` / `ve logout`。",
     ),
+    (
+        "Authentication mode for this invocation: aksk or zti. Precedence is --auth-mode <MODE>, [profile.tos].auth_mode, BYTETOS_AUTH_MODE, then aksk. ZTI uses SEC_TOKEN_STRING, a local Agent, or SEC_TOKEN_PATH, ignores local AK/SK, and never falls back to AK/SK.",
+        "本次调用的鉴权模式：aksk 或 zti。优先级为 --auth-mode <MODE>、[profile.tos].auth_mode、BYTETOS_AUTH_MODE，最后为 aksk。ZTI 使用 SEC_TOKEN_STRING、本地 Agent 或 SEC_TOKEN_PATH，忽略本地 AK/SK，且不会回退到 AK/SK。",
+    ),
+    ("Authentication mode for this invocation: aksk or zti", "本次调用的鉴权模式：aksk 或 zti"),
+    ("Authenticate using a ByteCloud ZTI token", "使用 ByteCloud ZTI Token 鉴权"),
     ("Availability zone", "可用区"),
     (
         "Bare AK/SK credential keys are written to the current command surface: `[active-profile.ve-tos]` for `ve-tos` and `[active-profile.tos]` for `tos`. Use an explicit `<profile>.access_key_id` or other two-segment credential key only when shared TOS credentials are intended. For `ve-tos`, an `endpoint` / `control_endpoint` / `account_id` / HTTP tuning key without an explicit binary qualifier is written to `[active-profile.ve-tos]` by default. For `tos`, `endpoint` and PSM keys are written to `[active-profile.tos]`; the `tos` entry rejects `control_endpoint` because only `ve-tos` has a control plane endpoint.",
@@ -1537,8 +1691,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ),
     ("ByteCloud TOS PSM service name.", "PSM 服务名。"),
     (
-        "CLI flag only. Supported by the `tos` command surface. When omitted, `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by themselves.",
-        "仅 CLI 参数。仅 tos 命令支持。未设置时，`--idc`、`--cluster` 和 `--addr-family` 不会单独启用 PSM 模式。",
+        "CLI flag only. Supported by the `tos` command surface. When omitted, `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by themselves. Set TOS_FORCE_PSM=true to skip bucket BNS routing and resolve the selected PSM directly through Consul.",
+        "仅 CLI 参数。仅 tos 命令支持。未设置时，`--idc`、`--cluster` 和 `--addr-family` 不会单独启用 PSM 模式。设置 TOS_FORCE_PSM=true 可跳过按 Bucket 的 BNS 路由，直接通过 Consul 解析所选 PSM。",
     ),
     (
         "IDC used with PSM service discovery",
@@ -1597,6 +1751,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Stream object content", "流式输出对象内容"),
     ("Upload stdin to an object", "将标准输入上传为对象"),
     ("Generate presigned URL", "生成预签名 URL"),
+    // [Review Fix #3] Keep the root Chinese help catalog aligned with TOS-only presign metadata.
+    ("Generate presigned URL (AK/SK only; ZTI is not supported)", "生成预签名 URL（仅支持 AK/SK，不支持 ZTI）"),
     ("Generate a presigned URL", "生成预签名 URL"),
     ("Restore archived objects", "恢复归档对象"),
     ("Restore archived object", "恢复归档对象"),
@@ -2509,6 +2665,7 @@ mod chinese_help_catalog_tests {
             "- region",
             "- requesttimeout",
             "- secret_access_key",
+            "share_base_url",
             "access_key_id / secret_access_key / security_token",
             "account_id / default_instance / default_space",
             "auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint",
@@ -2906,6 +3063,29 @@ mod chinese_help_catalog_tests {
             report
         );
     }
+
+    #[test]
+    fn chinese_receiver_help_localizes_trailing_slash_guidance() {
+        let mut root = Cli::command();
+        root.build();
+        let share = root
+            .find_subcommand_mut("ve-adrive")
+            .unwrap()
+            .find_subcommand_mut("share")
+            .unwrap();
+        for action in ["inspect", "files", "view", "download"] {
+            let english = share
+                .find_subcommand_mut(action)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            let chinese = localize_clap_help_zh(&english);
+            assert!(chinese.contains("末尾一个斜杠") && chinese.contains("末尾可带一个斜杠"));
+            assert!(chinese.contains("目录前缀通过 --path 指定"));
+            assert!(!chinese.contains("one optional trailing slash"));
+            assert!(!chinese.contains("one trailing slash"));
+        }
+    }
 }
 
 fn args_without_help_language(effective_args: &[String]) -> Vec<String> {
@@ -2937,6 +3117,7 @@ fn describe_language_for_canonical_dispatch(effective_args: &[String]) -> Option
     let needs_canonical_dispatch = match parsed.tool {
         ToolCommand::TosCli {
             command: tos_cli::TosCliCommand::Api(_),
+            ..
         }
         | ToolCommand::ADrive {
             command: ve_adrive_cli::ADriveCommand::Api(_),
@@ -3094,9 +3275,26 @@ fn byted_tos_grouped_help_zh() -> String {
     append_tos_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
     append_byted_tos_psm_options_zh(&mut output);
+    append_byted_tos_auth_zh(&mut output, &prefix);
     append_help_language_section_zh(&mut output);
     append_byted_examples_zh(&mut output, &prefix);
     translate_help_phrases_zh(&output)
+}
+
+fn append_byted_tos_auth_zh(output: &mut String, prefix: &str) {
+    let _ = writeln!(
+        output,
+        "鉴权:\n  --auth-mode <MODE>          aksk 或 zti（默认 aksk）"
+    );
+    let _ = writeln!(
+        output,
+        "  优先级：--auth-mode > [profile.tos].auth_mode > BYTETOS_AUTH_MODE > aksk。"
+    );
+    let _ = writeln!(
+        output,
+        "  ZTI 使用 SEC_TOKEN_STRING、本地 Agent 或 SEC_TOKEN_PATH，忽略本地 AK/SK，失败不回退。\n"
+    );
+    let _ = writeln!(output, "  {prefix} config set auth_mode zti\n");
 }
 
 fn adrive_grouped_help_zh() -> String {
@@ -3106,6 +3304,8 @@ fn adrive_grouped_help_zh() -> String {
     let _ = writeln!(output, "ADrive CLI - 面向 Agent\n");
     let _ = writeln!(output, "用法:\n  {prefix} <命令> [选项]\n");
     append_adrive_capability_group_zh(&mut output, "高阶命令", "high_level");
+    // [Review Fix #ShareHelp1] The grouped Chinese renderer must include every share leaf from the registry.
+    append_adrive_capability_group_zh(&mut output, "分享链接", "share");
     append_adrive_capability_group_zh(&mut output, "能力 / 工具", "utilities");
     append_adrive_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
@@ -3181,9 +3381,10 @@ fn append_tos_target_syntax_zh(output: &mut String) {
 
 fn append_byted_tos_psm_options_zh(output: &mut String) {
     let _ = writeln!(output, "ByteCloud TOS PSM 选项:");
+    // [Review Fix #17] 强制 PSM 模式会跳过 BNS，帮助文案只将 BNS 描述为默认路径。
     let _ = writeln!(
         output,
-        "      --psm <PSM>             PSM 服务名（通过 BNS 服务发现访问）"
+        "      --psm <PSM>             PSM 服务名（默认按 Bucket 经 BNS 路由）"
     );
     let _ = writeln!(
         output,
@@ -3196,6 +3397,10 @@ fn append_byted_tos_psm_options_zh(output: &mut String) {
     let _ = writeln!(
         output,
         "      --addr-family <VALUE>   与 --psm 配合使用的地址族：v4、v6 或 dual-stack\n"
+    );
+    let _ = writeln!(
+        output,
+        "设置 TOS_FORCE_PSM=true 可跳过 BNS，直接通过 Consul 解析所选 PSM。\n"
     );
 }
 
@@ -3313,12 +3518,33 @@ pub async fn run_multi_tool() {
 /// Runs the dedicated ByteCloud TOS CLI entry point used by the `tos-cli` entry crate.
 pub async fn run_byted_tos_cli() {
     init_tracing();
+    run_byted_tos_entry(None).await;
+}
+
+/// Runs the dedicated ByteTOS entry with an invocation-owned ZTI token provider.
+///
+/// `provider` is passed lazily to ByteTOS requests and is ignored in AK/SK mode.
+/// This returns after successful help/version output; command handlers may exit
+/// the process with the normal CLI exit code on success or error. The caller owns
+/// tracing setup; this entry does not initialize tracing or parse `RUST_LOG`.
+/// MCP tools can be planned with this provider, but `execute=true` is rejected
+/// because the MCP subprocess cannot inherit the caller-owned resolver.
+pub async fn run_byted_tos_cli_with_zti_provider(
+    provider: tos_core::infra::zti_credentials::ZtiTokenProvider,
+) {
+    run_byted_tos_entry(Some(provider)).await;
+}
+
+async fn run_byted_tos_entry(provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>) {
+    // [Review Fix #3] Injecting embedders own logging policy; parsing RUST_LOG here
+    // can emit misleading advice to remove the private build's security filter.
     let args: Vec<String> = std::env::args().collect();
     if maybe_print_direct_version(&args, "tos-cli") {
         return;
     }
     let effective_args = direct_tool_args(args, "byted-tos");
-    run_with_args(effective_args, InvocationSurface::BytedTosDirect).await;
+    run_with_args_and_zti_provider(effective_args, InvocationSurface::BytedTosDirect, provider)
+        .await;
 }
 
 /// Runs the dedicated TOS CLI entry point used by the `ve-tos-cli` entry crate.
@@ -3413,6 +3639,14 @@ fn canonical_tool_command(tool: &str) -> &str {
 }
 
 async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface) {
+    run_with_args_and_zti_provider(args, invocation_surface, None).await;
+}
+
+async fn run_with_args_and_zti_provider(
+    args: Vec<String>,
+    invocation_surface: InvocationSurface,
+    provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>,
+) {
     let binary_name = std::path::Path::new(&args[0])
         .file_stem()
         .and_then(|s| s.to_str())
@@ -3443,6 +3677,7 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
     };
     let effective_args = normalize_help_aliases(&effective_args);
     let effective_args = normalize_leading_help_flag(&effective_args);
+    let effective_args = normalize_bare_adrive_share_help(&effective_args);
     let _byted_profile_env_guard = is_byted_tos_invocation(&effective_args)
         .then(|| EnvGuard::set_from_env_or_remove("TOS_PROFILE", "BYTE_TOS_PROFILE"));
     let _byted_output_env_guard = is_byted_tos_invocation(&effective_args)
@@ -3502,8 +3737,13 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
     };
 
     match cli.tool {
-        ToolCommand::TosCli { command } => {
-            handle_byted_tos(cli.global, command).await;
+        ToolCommand::TosCli { auth, command } => {
+            let global = bind_byte_tos_auth(
+                cli.global,
+                auth.auth_mode.map(|mode| mode.as_str().to_string()),
+                provider,
+            );
+            handle_byted_tos(global, command).await;
         }
         ToolCommand::Tos { auth, command } => {
             let mut global = cli.global;
@@ -3514,6 +3754,17 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
             handle_adrive(cli.global, auth, command).await;
         }
     }
+}
+
+fn bind_byte_tos_auth(
+    mut global: GlobalArgs,
+    mode: Option<String>,
+    provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>,
+) -> GlobalArgs {
+    global.byte_tos_auth_mode = mode;
+    global.zti_token_provider =
+        Some(provider.unwrap_or_else(tos_core::infra::zti_source::provider));
+    global
 }
 
 fn configure_example_prefixes(invocation_surface: InvocationSurface) {
@@ -3667,7 +3918,10 @@ fn contextualized_help_text(effective_args: &[String], help: &str) -> String {
     if is_adrive_invocation(effective_args) {
         let prefix = std::env::var(ADRIVE_EXAMPLE_PREFIX_ENV)
             .unwrap_or_else(|_| "ve-adrive-cli".to_string());
-        let help = help.replace("ve-adrive-cli", &prefix);
+        // [Review Fix #ShareHelp3] Clap renders the unified usage path even inside the dedicated wrapper.
+        let help = help
+            .replace("ve-storage-uni-cli ve-adrive", &prefix)
+            .replace("ve-adrive-cli", &prefix);
         let help = strip_control_plane_global_help(&help);
         return strip_psm_global_help(&help);
     }
@@ -3686,7 +3940,45 @@ fn strip_byted_tos_unsupported_help(help: &str) -> String {
     // [Review Fix #TOS-StorageHelp] Strip the whole clap option block so the
     // removed `--storage-class` flag cannot leave its description under the
     // neighboring option.
-    strip_clap_help_option_blocks(help, &["--storage-class"])
+    let help = strip_clap_help_option_blocks(help, &["--storage-class"]);
+    byte_tos_recursive_list_help(&help)
+}
+
+fn byte_tos_recursive_list_help(help: &str) -> String {
+    // [Review Fix #15] ByteTOS reuses ve-tos clap argument types but rejects
+    // auto/flat at execution; show only the value users can actually select.
+    let mut in_list_mode = false;
+    let mut lines = Vec::new();
+    for line in help.lines() {
+        if line.contains("--recursive-list-mode") {
+            in_list_mode = true;
+        } else if in_list_mode && is_clap_help_block_boundary(line) {
+            in_list_mode = false;
+        }
+        let value = line.trim_start();
+        if in_list_mode && (value.starts_with("- auto:") || value.starts_with("- flat:")) {
+            continue;
+        }
+        lines.push(if in_list_mode {
+            line.replace(
+                "Recursive listing mode: auto, flat, or hierarchical",
+                "Recursive listing mode: hierarchical only",
+            )
+            // [Review Fix #25] clap -h renders enum values inline, unlike
+            // --help's expanded bullets; narrow that form as well.
+            .replace(
+                "[possible values: auto, flat, hierarchical]",
+                "[possible values: hierarchical]",
+            )
+        } else {
+            line.to_string()
+        });
+    }
+    let mut output = lines.join("\n");
+    if help.ends_with('\n') {
+        output.push('\n');
+    }
+    output
 }
 
 fn strip_clap_help_option_blocks(help: &str, option_names: &[&str]) -> String {
@@ -3766,7 +4058,18 @@ fn maybe_emit_byted_tos_describe_recovery(effective_args: &[String]) -> bool {
             "implemented_layers": ["high_level", "utilities"],
             "unimplemented_layers": ["low_level"],
             "listing_semantics": {"delimiter": "/"},
+            "authentication": tos_core::infra::byte_tos_auth::byte_tos_auth_metadata(),
         })
+    } else if let Some(desc) =
+        ve_tos_cli::handler::high_level::describe_byte_tos_high_level_command(&command)
+    {
+        // [Review Fix #21] Missing positional operands take the same rich
+        // metadata path as a successfully parsed ByteTOS command.
+        serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
+    } else if let Some(desc) =
+        ve_tos_cli::handler::config::describe_config_action_for_recovery(&command)
+    {
+        serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
     } else if let Some(desc) = tos_cli::handler::meta::describe_tos_command_metadata(&command) {
         serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
     } else if let Some(row) = tos_cli::registry::find_capability(&command) {
@@ -3868,9 +4171,10 @@ fn maybe_emit_adrive_describe_recovery(effective_args: &[String]) -> bool {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "ADrive CLI high-level file operations and agent utilities",
             "uri_format": "adrive://instance/space/folder/file",
-            "implemented_layers": ["high_level", "utilities"],
+            "implemented_layers": ["high_level", "utilities", "share"],
             "unimplemented_layers": ["raw_api_execution"],
             "groups": [
+                {"name":"share","command":"ve-adrive share","description":"Manage and receive share links"},
                 {
                     "name": "high_level",
                     "command": "ve-adrive",
@@ -3983,6 +4287,14 @@ fn recovered_command_path(effective_args: &[String], tool: &str) -> String {
         return canonical_tool_command(tool).to_string();
     }
     if tool == "byted-tos" {
+        // [Review Fix #20] Config actions are parsed by Clap but not separate
+        // capability rows; retain the leaf when recovering missing operands.
+        if tokens.len() >= 2
+            && tokens[0] == "config"
+            && matches!(tokens[1], "init" | "show" | "set")
+        {
+            return format!("tos config {}", tokens[1]);
+        }
         for len in (1..=tokens.len()).rev() {
             let candidate = format!("tos {}", tokens[..len].join(" "));
             if tos_cli::registry::find_capability(&candidate).is_some() {
@@ -4006,7 +4318,46 @@ fn recovered_command_path(effective_args: &[String], tool: &str) -> String {
             }
         }
     }
+    if tool == "ve-adrive" {
+        return recovered_adrive_command_path(&tokens);
+    }
     format!("{} {}", canonical_tool_command(tool), tokens.join(" "))
+}
+
+fn recovered_adrive_command_path(tokens: &[&str]) -> String {
+    // [Review Fix #Rebase4] Utility leaves are absent from capability rows;
+    // retain their actions without copying operands or share URL secrets.
+    let utility_path = match tokens {
+        ["config", action @ ("init" | "show" | "set"), ..] => {
+            Some(format!("ve-adrive config {action}"))
+        }
+        ["skill", "list" | "ls", ..] => Some("ve-adrive skill list".into()),
+        ["skill", "export", ..] => Some("ve-adrive skill export".into()),
+        ["api", group, action, ..]
+            if [group, action].iter().all(|identifier| {
+                !identifier.is_empty()
+                    && identifier
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            }) =>
+        {
+            Some(format!("ve-adrive api {group} {action}"))
+        }
+        _ => None,
+    };
+    if let Some(command) = utility_path {
+        return command;
+    }
+    for len in (1..=tokens.len()).rev() {
+        let candidate = format!("ve-adrive {}", tokens[..len].join(" "));
+        if ve_adrive_cli::registry::find_capability(&candidate).is_some() {
+            return candidate;
+        }
+    }
+    if tokens.first() == Some(&"share") {
+        return "ve-adrive share".into();
+    }
+    "ve-adrive".into()
 }
 
 fn recovered_global_args(effective_args: &[String]) -> GlobalArgs {
@@ -4096,6 +4447,29 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--trace-dir"
             | "--trace-redact"
             | "--language"
+            | "--credentials-path"
+            | "--instance"
+            | "--space"
+            | "--folder"
+            | "--file"
+            | "--name"
+            | "--description"
+            | "--permission"
+            | "--expires-in"
+            | "--require-login"
+            | "--preview-limit"
+            | "--download-limit"
+            | "--share-base-url"
+            | "--creator"
+            | "--status"
+            | "--created-at-start"
+            | "--created-at-end"
+            | "--offset"
+            | "--limit"
+            | "--updated-at"
+            | "--path"
+            | "--marker"
+            | "--checkpoint"
             | "--help-language"
     )
 }
@@ -4140,7 +4514,7 @@ fn emit_parse_error(effective_args: &[String], tool: &str, err: &clap::Error) {
         ErrorDetail {
             status_code: None,
             code: "ValidationError".to_string(),
-            message: err.to_string(),
+            message: sanitize_share_parse_error(effective_args, tool, err.to_string()),
             exit_code: exit_code.as_i32(),
             kind: ErrorKind::ValidationError,
             category: AgentErrorCategory::InvalidParam,
@@ -4164,7 +4538,39 @@ fn emit_parse_error(effective_args: &[String], tool: &str, err: &clap::Error) {
     );
 }
 
+fn sanitize_share_parse_error(arguments: &[String], tool: &str, mut message: String) -> String {
+    if tool != "ve-adrive" || !arguments.iter().any(|argument| argument == "share") {
+        return message;
+    }
+    // [Review Fix #ShareParse1] Clap may echo URLs before typed handlers remove query or userinfo secrets.
+    let mut secret_urls = arguments
+        .iter()
+        .flat_map(|argument| {
+            std::iter::once(argument.as_str()).chain(
+                argument
+                    .strip_prefix("--")
+                    .and_then(|flag| flag.split_once('=').map(|(_, value)| value)),
+            )
+        })
+        .filter(|argument| {
+            argument.contains("://") || argument.contains('?') || argument.contains("pwd=")
+        })
+        .collect::<Vec<_>>();
+    // [Review Fix #ShareParse2] Replace longer URLs first so a shared path prefix cannot leave its password query behind.
+    secret_urls.sort_unstable_by_key(|argument| std::cmp::Reverse(argument.len()));
+    for argument in secret_urls {
+        message = message.replace(argument, "[redacted share URL]");
+    }
+    message
+}
+
 fn parse_error_command(effective_args: &[String], tool: &str) -> String {
+    // [Review Fix #ShareParseCommand1] Recover only registered ADrive paths; unknown actions are user input and may contain URL secrets.
+    if tool == "ve-adrive" {
+        return ve_adrive_cli::handler::common::public_adrive_command_path(
+            &recovered_command_path(effective_args, tool),
+        );
+    }
     let mut command = Vec::new();
     let mut seen_tool = false;
     for arg in effective_args.iter().skip(1) {
@@ -4831,18 +5237,31 @@ async fn handle_adrive(
             let command_path = ve_adrive_cli::handler::common::public_adrive_command_path(
                 &ve_adrive_cli::command_path(&command),
             );
-            let guidance = ve_adrive_cli::handler::common::adrive_error_guidance(
-                &global,
-                auth.auth_mode,
-                &err,
-                &command_path,
-            );
-            let category = ve_adrive_cli::handler::common::adrive_error_category(
-                &global,
-                auth.auth_mode,
-                &err,
-            )
-            .unwrap_or(semantics.category);
+            let is_receiver = matches!(&command, ve_adrive_cli::ADriveCommand::Share(group) if matches!(group.action,Some(ve_adrive_cli::cli::share::ShareAction::Inspect(_)|ve_adrive_cli::cli::share::ShareAction::Files(_)|ve_adrive_cli::cli::share::ShareAction::View(_)|ve_adrive_cli::cli::share::ShareAction::Download(_))));
+            // [Review Fix #ShareReceiveGuidance1] Anonymous errors remain account-independent; explicit OAuth preserves the established login/refresh guidance.
+            let is_anonymous_receiver =
+                is_receiver && auth.auth_mode != Some(ve_adrive_cli::domain::auth::AuthMode::Oauth);
+            let guidance = if is_anonymous_receiver {
+                ve_adrive_cli::handler::common::AdriveErrorGuidance {
+                    suggested_action:
+                        "Check the share link, its password and anonymous access settings".into(),
+                    fix_command: Some(format!("{command_path} --help")),
+                    doctor_hint: None,
+                }
+            } else {
+                ve_adrive_cli::handler::common::adrive_error_guidance(
+                    &global,
+                    auth.auth_mode,
+                    &err,
+                    &command_path,
+                )
+            };
+            let category = if is_anonymous_receiver {
+                semantics.category
+            } else {
+                ve_adrive_cli::handler::common::adrive_error_category(&global, auth.auth_mode, &err)
+                    .unwrap_or(semantics.category)
+            };
             let error_detail = ErrorDetail {
                 status_code: semantics.status_code,
                 code: semantics.code.clone(),
@@ -4911,6 +5330,9 @@ async fn handle_adrive_inner(
             ve_adrive_cli::handler::high_level::handle_high_level_command(global, auth, command)
                 .await
         }
+        ve_adrive_cli::ADriveCommand::Share(group) => {
+            ve_adrive_cli::handler::share::handle_share_command(global, auth, group).await
+        }
         ve_adrive_cli::ADriveCommand::Capabilities(args) => {
             ve_adrive_cli::handler::meta::handle_capabilities_command(global, args).await
         }
@@ -4935,5 +5357,39 @@ async fn handle_adrive_inner(
         ve_adrive_cli::ADriveCommand::Auth(command) => {
             ve_adrive_cli::handler::auth::handle_auth_command(global, auth, command).await
         }
+    }
+}
+
+#[cfg(test)]
+mod zti_entry_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tos_core::infra::zti_credentials::ZtiTokenProvider;
+
+    #[tokio::test]
+    async fn byte_entry_binds_provider_without_resolving_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let provider = ZtiTokenProvider::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok("synthetic-entry-token".to_string()) }
+        });
+        let global = bind_byte_tos_auth(GlobalArgs::default(), Some("zti".into()), Some(provider));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(global.byte_tos_auth_mode.as_deref(), Some("zti"));
+        assert_eq!(
+            global
+                .clone()
+                .zti_token_provider
+                .unwrap()
+                .get_header_value()
+                .await
+                .unwrap(),
+            "synthetic-entry-token"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

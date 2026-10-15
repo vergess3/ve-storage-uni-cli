@@ -1357,7 +1357,15 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
 ];
 
 pub fn capabilities() -> &'static [CapabilityRow] {
-    CAPABILITIES
+    static ALL: std::sync::OnceLock<Vec<CapabilityRow>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        CAPABILITIES
+            .iter()
+            .chain(crate::share_registry::SHARE_CAPABILITIES)
+            .cloned()
+            .collect()
+    })
+    .as_slice()
 }
 
 pub fn command_domains() -> Vec<&'static str> {
@@ -1540,11 +1548,11 @@ mod tests {
         let skill = include_str!("../../../skills/ve-adrive-cli/SKILL.md");
         let readme = include_str!("../../../README.md");
         for surface in [skill, readme] {
+            // [Review Fix #ShareRegistryEnvDedup1] Check each documentation expectation once without duplicate coverage.
             for expected in [
-                "aksk, oauth, or unified",
                 "ADRIVE_AUTH_MODE",
                 "ve login",
-                "ve-adrive-cli --profile default --auth-mode unified ls",
+                "same-name",
                 "ve-adrive-cli config set auth_mode unified",
             ] {
                 assert!(surface.contains(expected), "surface missing {expected}");

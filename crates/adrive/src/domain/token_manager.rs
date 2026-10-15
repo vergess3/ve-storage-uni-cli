@@ -126,9 +126,11 @@ impl OAuthTokenManager {
     }
 
     /// Return the selected OAuth Access Token and bound user ID from one credential state.
+    /// An optional receiver instance is checked against that same file snapshot before use/refresh.
     pub(crate) async fn access_token_and_user_id(
         &self,
         apply_refresh_window: bool,
+        receiver_instance: Option<&str>,
     ) -> Result<(String, Option<String>), CliError> {
         match &self.source {
             CredentialSource::Environment { access_token } => access_token
@@ -137,17 +139,20 @@ impl OAuthTokenManager {
                 .ok_or_else(|| login_required("environment Access Token is missing")),
             CredentialSource::File => {
                 let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
+                validate_snapshot_instance(&stored, receiver_instance)?;
                 if let Some(snapshot) = oauth_credential_snapshot(&stored, apply_refresh_window)? {
                     return Ok(snapshot);
                 }
                 let _guard =
                     RefreshLockGuard::acquire(&self.credentials_path, &self.profile_name).await?;
                 let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
+                validate_snapshot_instance(&stored, receiver_instance)?;
                 if let Some(snapshot) = oauth_credential_snapshot(&stored, apply_refresh_window)? {
                     return Ok(snapshot);
                 }
                 self.refresh_locked(stored).await?;
                 let refreshed = load_oauth(&self.credentials_path, &self.profile_name)?;
+                validate_snapshot_instance(&refreshed, receiver_instance)?;
                 // [Review Fix #4] A just-refreshed Token is valid until expiry even
                 // inside the proactive refresh window used before a refresh.
                 oauth_credential_snapshot(&refreshed, false)?.ok_or_else(|| {
@@ -359,6 +364,24 @@ impl OAuthTokenManager {
         }
         Ok(())
     }
+}
+
+fn validate_snapshot_instance(
+    stored: &StoredOAuthCredentials,
+    expected: Option<&str>,
+) -> Result<(), CliError> {
+    // [Review Fix #ShareReceiveAuth6] A profile can change between receiver requests; validate the instance in the snapshot used to authenticate each attempt.
+    if expected.is_some_and(|expected| {
+        stored
+            .instance_id
+            .as_deref()
+            .is_some_and(|bound| bound != expected)
+    }) {
+        return Err(login_required(
+            "OAuth credentials belong to a different ADrive Instance",
+        ));
+    }
+    Ok(())
 }
 
 struct ValidatedRefreshToken {

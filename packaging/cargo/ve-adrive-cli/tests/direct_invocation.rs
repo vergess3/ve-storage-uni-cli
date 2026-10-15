@@ -16,6 +16,57 @@
 
 use std::process::Command;
 
+// [Review Fix #Rebase2] Keep master's ADrive auth-mode boundary alongside share redaction coverage.
+#[test]
+fn direct_entry_rejects_bytetos_zti_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+        .args([
+            "--auth-mode",
+            "zti",
+            "doctor",
+            "--check",
+            "auth",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run ve-adrive-cli");
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("invalid value 'zti'"));
+    assert!(message.contains("aksk, oauth, unified"));
+}
+
+#[test]
+fn share_parse_errors_keep_canonical_commands_and_hide_url_passwords() {
+    for args in [
+        vec![
+            "share",
+            "https://x.test/share/s?pwd=fixture-leak",
+            "--output",
+            "json",
+        ],
+        vec![
+            "share",
+            "files",
+            "https://x.test/share/s",
+            "--unknown=https://x.test/share/s?pwd=fixture-leak",
+            "--output",
+            "json",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("fixture-leak"), "{stderr}");
+        assert!(stderr.contains("ValidationError"));
+    }
+}
+
 #[test]
 fn dedicated_adrive_cli_direct_invocation() {
     let help = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
@@ -30,7 +81,13 @@ fn dedicated_adrive_cli_direct_invocation() {
     assert!(!stdout.contains("--control-endpoint"));
     assert!(!stdout.contains("--account-id"));
 
+    // [Review Fix #ShareTestIsolation2] Standalone dry-run must not read the developer machine's config.
+    let config_path =
+        std::env::temp_dir().join(format!("adrive-direct-test-{}.toml", std::process::id()));
+    std::fs::write(&config_path, "").unwrap();
     let dry_run = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+        .arg("--config-path")
+        .arg(&config_path)
         .args(["ls", "--dry-run", "--output", "json"])
         .output()
         .expect("Failed to execute ve-adrive-cli dry-run");
@@ -39,6 +96,7 @@ fn dedicated_adrive_cli_direct_invocation() {
     assert!(stdout.contains("\"status\": \"success\""));
     assert!(stdout.contains("\"command\": \"ve-adrive ls\""));
     assert!(stdout.contains("\"dry_run\": true"));
+    std::fs::remove_file(config_path).unwrap();
 }
 
 #[test]
@@ -66,4 +124,40 @@ fn dedicated_adrive_cli_rejects_control_plane_global_flags() {
         assert!(stderr.contains(flag), "stderr={stderr}");
         assert!(stderr.contains("does not support"), "stderr={stderr}");
     }
+}
+
+#[test]
+fn dedicated_share_leaf_describe_and_help_are_available() {
+    for action in [
+        "create", "get", "list", "update", "cancel", "inspect", "files", "download",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+            .args(["share", action, "--describe", "--output", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!("ve-adrive share {action}")));
+    }
+}
+
+#[test]
+fn dedicated_bare_share_help_is_chinese_and_contextual() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+        .args(["share", "--language", "zh"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("取消分享链接"));
+    assert!(stdout.contains("ve-adrive-cli share"));
+    assert!(!stdout.contains("Cancel a share link"));
 }

@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 use tos_core::agent::dryrun::{DryRunResult, Impact};
@@ -102,6 +104,71 @@ const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
 // Exact owner catalog: identifiers inside each full phrase remain unchanged.
 const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("Path to config TOML", "配置 TOML 路径"),
+    ("Path to credentials TOML", "凭据 TOML 路径"),
+    ("Confirm share cancellation", "确认分享取消操作"),
+    ("Share Links:", "分享链接："),
+
+    (crate::cli::share::SHARE_RECEIVER_HELP, "inspect/files/view/download 默认匿名，即使 profile 配置了 OAuth。显式 --auth-mode oauth 通过 auth login/status 复用 --profile 和现有 token 刷新机制；不会自动登录或回退到其他身份。OAuth 用于分享概况及 token 交换；文件 API 仅使用 x-share-token，内容下载不携带账户凭据。服务端验证登录和分享权限；设置了提取码时仍须提供。公开 URL 支持 /share/<id> 和 /share/<id>/，末尾一个斜杠会被规范化移除。目录前缀通过 --path 指定，不追加到 URL 路径。"),
+    (crate::cli::share::SHARE_FILES_HELP, "files 返回一页目录：--limit 设置条数，--marker 使用上一页的 NextMarker；IsTruncated=false 时结束。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。Download 自动枚举各页。files 的默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。表格 Total 为展示行数；JSON 和显式 --query 保留服务原始数组。"),
+    ("Manage and receive share links", "管理和接收分享链接"),
+    ("Create a share link", "创建分享链接"),
+    ("Get a share link", "获取分享链接"),
+    ("List share links", "列举分享链接"),
+    ("Update share settings", "更新分享设置"),
+    ("Cancel a share link", "取消分享链接"),
+    ("Inspect share info", "查看分享信息"),
+    ("List shared files", "列举分享文件"),
+    ("Preview one shared file", "预览一个分享文件"),
+    ("Exact file path; omitted selects a single shared file", "精确文件路径；省略时自动选择唯一的分享文件"),
+    ("Stream original bytes to a pipe or redirected stdout", "将原始字节输出到管道或重定向的标准输出"),
+    ("Safe content headers for raw metadata results", "原始内容元数据结果中的安全内容头"),
+    ("Short-lived document capability URL", "短期有效的文档访问凭证 URL"),
+    (crate::cli::share::SHARE_VIEW_HELP, "view 预览一个精确文件；省略 --path 时自动选择唯一的分享文件。文件夹或多个根条目需要 --path 指定文件。默认 auto 为支持的文档返回短期 PDF PreviewURL，其他文件返回原始内容元数据；不会打开浏览器。--raw 将原始字节输出到管道或重定向的 stdout（例如 | less），拒绝终端 stdout，且与 --output/--query 冲突。预览请求消耗 PreviewLimit，绝不自动重试。文档 URL 是临时访问凭证，请保密。不支持该能力的部署可能返回 404。密码优先级为 stdin > URL pwd > 终端隐藏提示；--password-stdin 读取至 EOF。"),
+    ("Download shared files", "下载分享文件"),
+    ("Share name", "分享名称"),
+    ("Share description", "分享描述"),
+    ("Share permission: view or download", "分享权限：view 或 download"),
+    ("Share lifetime duration; 0 means never expires", "分享有效时长；0 表示永不过期"),
+    ("Read one share password from stdin (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取一个分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    (crate::cli::share::SHARE_SETTINGS_HELP, "创建默认 view（仅预览）；允许下载时显式使用 --permission download。更新时未传的设置保持不变。SharePwd 和 RequireLogin 是服务端字段：create/update 的 --password-stdin 设置分享密码，files/view/download 用它提供提取码。RequireLogin 控制接收者登录；管理使用当前账户。接收默认匿名；显式 --auth-mode oauth 使用所选接收者 profile。"),
+    // [Review Fix #Download5] Receiver password input authenticates access and never mutates server settings.
+    ("Read the receiver password from stdin; does not change the share password (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取接收密码；不会修改分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    ("Read the receiver password from stdin; it does not change the share password (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)", "从标准输入读取接收密码；不会修改分享密码；输入结束于 EOF，可使用管道，或在 macOS/Linux 终端回车后按 Ctrl-D"),
+    ("Require receiver login; accepts explicit true or false", "要求接收者登录；显式接受 true 或 false"),
+    ("Maximum preview count; 0 means unlimited", "最大预览次数；0 表示无限制"),
+    ("Maximum download count; 0 means unlimited", "最大下载次数；0 表示无限制"),
+    ("ADrive file or folder target", "ADrive 文件或文件夹目标"),
+    ("Share page origin override", "分享页面源地址覆盖值"),
+    ("Share identifier", "分享标识符"),
+    ("Share identifier or adrive://instance/share-id", "分享标识符或 adrive://instance/share-id"),
+    ("Treat the share target instance as a name and resolve it to an ID", "将分享目标中的实例视为名称并解析为 ID"),
+    ("ADrive instance identifier; required for a bare ShareID, optional for a share URI", "ADrive 实例标识符；仅传 ShareID 时必填，分享 URI 已带实例时可省略"),
+    (crate::cli::share::SHARE_SELECTOR_HELP, "get/update/cancel 接受 adrive://instance/share-id，或 ShareID 加 --instance。重复指定的 --instance 必须与 URI 一致；--by-name 仅解析实例名称。分享 URI 的 ShareID 为一个路径段，组件仅解码一次；文件/空间目标由其命令上下文解析。"),
+    ("ADrive instance target: adrive://instance", "ADrive 实例目标：adrive://instance"),
+    ("ADrive instance identifier; required unless an instance URI is supplied", "ADrive 实例标识符；未传实例 URI 时必填"),
+    (crate::cli::share::SHARE_LIST_HELP, "list 接受 adrive://instance（可带根目录斜杠），或 --instance instance。重复指定的 --instance 必须与 URI 一致；--by-name 解析实例名称。实例 URI 不含分享/空间/文件路径，且仅解码一次。List 返回一页；仅当 OAuth 提供绑定的 user_id 时可省略 --creator。"),
+    ("Creator user identifier; repeat for multiple creators", "创建者用户标识符；多个创建者可重复使用"),
+    ("Share lifecycle status", "分享生命周期状态"),
+    ("Creation time range start in RFC3339", "RFC3339 格式的创建时间范围起点"),
+    ("Creation time range end in RFC3339", "RFC3339 格式的创建时间范围终点"),
+    ("Search offset, at most 10000", "搜索偏移量，最大 10000"),
+    ("Maximum entries in this page", "本页最大条目数"),
+    ("Optimistic concurrency timestamp; omitted fetches the current value", "乐观并发时间戳；省略时获取当前值"),
+    ("Public share URL (one optional trailing slash); optional pwd query is kept secret", "公开分享 URL（末尾可带一个斜杠）；可选 pwd 查询参数保密处理"),
+    ("Exact file path or directory path ending in slash", "精确文件路径或以斜杠结尾的目录路径"),
+    ("Destination directory for shared files", "分享文件的目标目录"),
+    ("Recursively download selected folders", "递归下载选定文件夹"),
+    ("Overwrite existing destination files", "覆盖已存在的目标文件"),
+    ("Checkpoint file for file-level resume", "文件级续传使用的 checkpoint 文件"),
+    ("Automatically range-download files at this size (default 20MB), even without a checkpoint", "自动启用 Range 下载的文件大小阈值，默认 20MB，无需 checkpoint"),
+    ("Maximum ranges transferred concurrently for one file (default 4)", "单文件的最大 Range 并发数，默认 4"),
+    ("Resume using the checkpoint file", "使用 checkpoint 文件续传"),
+    ("Share password supplied through child stdin", "通过子进程标准输入提供的分享密码"),
+    ("Share password returned for authorized delivery", "为授权交付返回的分享密码"),
+    ("Share settings are mutable; the shared target cannot change.", "分享设置可修改；分享目标不可更改。"),
+    ("Anonymous receiver access never loads account credentials.", "匿名接收访问不加载账户凭据。"),
+
     // Capability descriptions.
     ("Copy local files, ADrive files, or folders", "复制本地文件、ADrive 文件或文件夹"),
     ("Move files or folders by same-space rename or copy plus source delete", "通过同空间重命名，或复制后删除源文件/文件夹来移动"),
@@ -156,6 +223,9 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Progress granularity: part or byte", "进度粒度：part 或 byte"),
     ("Enable execution progress output on stderr", "在 stderr 启用执行进度输出"),
     ("Disable execution progress output on stderr", "在 stderr 禁用执行进度输出"),
+    ("Enable execution progress output even when stderr is not a TTY", "即使 stderr 不是 TTY 也启用执行阶段进度输出"),
+    ("Disable execution progress output", "禁用执行阶段进度输出"),
+    ("Validated completed files reused during resume; included in Completed", "恢复时复用的已验证完成文件，包含在 Completed 中"),
     ("Enable listing-phase echo output on stderr", "在 stderr 启用列举阶段回显"),
     ("Disable listing-phase echo output on stderr", "在 stderr 禁用列举阶段回显"),
     ("Write planned transfer manifest CSV base path", "写入计划传输 manifest CSV 基础路径"),
@@ -242,6 +312,8 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Pass global --dry-run to the CLI command", "向 CLI 命令传递全局 --dry-run"),
     ("Pass global --describe to the CLI command", "向 CLI 命令传递全局 --describe"),
     ("Configuration profile name", "配置 profile 名称"),
+    // [Review Fix #ShareReceiveDocs1] Common MCP schema additions must also pass the owner translation audit.
+    ("Explicit ADrive authentication mode; share receivers use the selected OAuth profile only when oauth is specified", "显式 ADrive 鉴权模式；分享接收仅在指定 oauth 时使用所选 OAuth profile"),
     ("Output format, defaults to json", "输出格式，默认为 json"),
     ("Optional global region override", "可选的全局 region 覆盖"),
     ("Optional global endpoint override", "可选的全局 endpoint 覆盖"),
@@ -299,6 +371,15 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Derived from the live ADrive CLI capability registry.", "源自 live ADrive CLI capability registry。"),
     ("Portable Markdown skill pack for external agents, documentation generators, prompts, or adapters. The built-in MCP server rebuilds tools from the in-process registry instead of reading exported files.", "供外部 Agent、文档生成器、prompt 或适配器使用的 portable Markdown Skill 包。内置 MCP 服务从进程内 registry 重建工具，不读取导出文件。"),
     ("tools/call returns a plan by default; include argument execute=true to run the underlying CLI command.", "tools/call 默认返回计划；包含参数 execute=true 才运行底层 CLI 命令。"),
+    // [Review Fix #Rebase3] Sharing semantics are public discovery prose and
+    // require the same bilingual coverage as the existing high-level domains.
+    ("create/get/list/update/cancel use the V1 share management APIs with the selected account authentication", "create/get/list/update/cancel 使用 V1 分享管理 API 和所选账户鉴权"),
+    ("delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders", "文件和文件夹的交付 URL 均由分享页面域名和 /share/<编码后的 ShareID> 拼接"),
+    ("inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token", "inspect/files/view/download 默认匿名接收公开分享 URL；显式 --auth-mode oauth 使用接收者 profile 获取概况及交换 token，后续文件 API 仅携带 x-share-token"),
+    ("files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume", "files 支持单个文件或一页目录列表；递归下载构建有界清单，并支持文件级 checkpoint 恢复"),
+    // [Review Fix #LiveDocs1] Share Describe/export uses this independent translation catalog.
+    (crate::cli::share::SHARE_CONNECTION_HELP, "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-base-url，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
+    (crate::cli::share::SHARE_DOWNLOAD_HELP, "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点。恢复时比较解析后的根目录。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 需要分享者开启 --permission download。"),
 ];
 
 const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
@@ -379,6 +460,25 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
     (
         "mkdir",
         &["adrive://instance/space/folder -> create_folder; --parents creates missing parent folders as needed"],
+    ),
+    // [Review Fix #Rebase3] Every advertised high-level domain must describe
+    // its routing so capability consumers can plan sharing operations.
+    (
+        "share",
+        &[
+            "create/get/list/update/cancel use the V1 share management APIs with the selected account authentication",
+            "delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders",
+            "inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token",
+            "files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume",
+            crate::cli::share::SHARE_CONNECTION_HELP,
+            crate::cli::share::SHARE_DOWNLOAD_HELP,
+            crate::cli::share::SHARE_SELECTOR_HELP,
+            crate::cli::share::SHARE_LIST_HELP,
+            crate::cli::share::SHARE_SETTINGS_HELP,
+            crate::cli::share::SHARE_RECEIVER_HELP,
+            crate::cli::share::SHARE_FILES_HELP,
+            crate::cli::share::SHARE_VIEW_HELP,
+        ],
     ),
 ];
 
@@ -678,6 +778,9 @@ fn compact_capability(row: &CapabilityRow) -> Value {
         "risk_level": row.risk_level,
         "destructive": row.destructive,
         "supports_force": row.supports_force,
+        // [Review Fix #Rebase5] Cancellation has an explicit --yes gate rather
+        // than the force/confirm contract reserved for critical file deletes.
+        "supports_yes": crate::share_metadata::supports_yes(row.command),
         // [Review Fix #3] Registry metadata is authoritative; the previous
         // hand-written allowlist incorrectly reported auth describe as false.
         "supports_dry_run": row.supports_dry_run,
@@ -1051,7 +1154,13 @@ fn usage_metadata_context(key: &str, value: &Value) -> ADriveMetadataContext {
 fn structured_metadata_context(key: &str, value: &Value) -> ADriveMetadataContext {
     match key {
         "scenario_routing" => ADriveMetadataContext::ScenarioRouting,
-        "shell_quoting_tips" | "notes" | "guidance" | "recovery" => {
+        // [Review Fix #LiveDocs2] Semantics arrays are prose, while command/path identifiers remain machine fields.
+        "shell_quoting_tips"
+        | "notes"
+        | "guidance"
+        | "recovery"
+        | "semantics"
+        | "high_level_semantics" => {
             if value.is_string() {
                 ADriveMetadataContext::HumanText
             } else {
@@ -1088,6 +1197,9 @@ fn adrive_metadata_translation_zh(text: &str) -> Option<&'static str> {
 
 fn public_capability_row(row: &CapabilityRow) -> Value {
     let mut value = serde_json::to_value(row).unwrap_or_else(|_| json!({}));
+    // [Review Fix #Rebase5] Full/tree views serialize registry rows separately
+    // from compact discovery; publish the same cancellation confirmation gate.
+    value["supports_yes"] = json!(crate::share_metadata::supports_yes(row.command));
     value["examples"] = json!(row
         .examples
         .iter()
@@ -1135,16 +1247,23 @@ fn skill_input_schema(row: &CapabilityRow) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for parameter in row.parameters {
-        properties.insert(
-            parameter.name.to_string(),
-            json!({
-                "type": parameter_schema_type(parameter.name),
-                "description": parameter.description,
-            }),
-        );
+        // [Review Fix #ShareView2] MCP captures structured output; raw byte streams are supported only by the CLI.
+        if row.command == "ve-adrive share view" && parameter.name == "raw" {
+            continue;
+        }
+        let mut schema = if row.command.starts_with("ve-adrive share ") {
+            crate::share_metadata::parameter_schema(row.command, parameter.name)
+        } else {
+            json!({"type":parameter_schema_type(parameter.name)})
+        };
+        schema["description"] = json!(parameter.description);
+        properties.insert(parameter.name.to_string(), schema);
         if parameter.required {
             required.push(parameter.name);
         }
+    }
+    if crate::share_metadata::supports_password(row.command) {
+        properties.insert("password".into(),json!({"type":"string","maxLength":4096,"writeOnly":true,"description":"Share password supplied through child stdin"}));
     }
     for (name, schema) in mcp_common_schema_properties() {
         properties.entry(name.to_string()).or_insert(schema);
@@ -1176,8 +1295,8 @@ fn parameter_schema_type(name: &str) -> &'static str {
     }
 }
 
-fn mcp_common_schema_properties() -> [(&'static str, Value); 9] {
-    [
+fn mcp_common_schema_properties() -> Vec<(&'static str, Value)> {
+    let mut properties = vec![
         (
             "execute",
             json!({"type": "boolean", "description": "Execute the CLI command; false returns a plan only"}),
@@ -1193,6 +1312,10 @@ fn mcp_common_schema_properties() -> [(&'static str, Value); 9] {
         (
             "profile",
             json!({"type": "string", "description": "Configuration profile name"}),
+        ),
+        (
+            "auth_mode",
+            json!({"type":"string","enum":["aksk","oauth","unified"],"description":"Explicit ADrive authentication mode; share receivers use the selected OAuth profile only when oauth is specified"}),
         ),
         (
             "output",
@@ -1214,13 +1337,35 @@ fn mcp_common_schema_properties() -> [(&'static str, Value); 9] {
             "quiet",
             json!({"type": "boolean", "description": "Disable prompts and progress output"}),
         ),
+    ];
+    properties.extend(mcp_environment_schema_properties());
+    properties
+}
+fn mcp_environment_schema_properties() -> [(&'static str, Value); 3] {
+    [
+        (
+            "config_path",
+            json!({"type":"string","description":"Path to config TOML"}),
+        ),
+        (
+            "credentials_path",
+            json!({"type":"string","description":"Path to credentials TOML"}),
+        ),
+        (
+            "yes",
+            json!({"type":"boolean","description":"Confirm share cancellation"}),
+        ),
     ]
 }
 
 fn is_boolean_parameter(name: &str) -> bool {
     matches!(
         name,
-        "force"
+        "password-stdin"
+            | "checkpoint"
+            | "overwrite"
+            | "resume"
+            | "force"
             | "by-name"
             | "recursive"
             | "include-parent"
@@ -1232,6 +1377,7 @@ fn is_boolean_parameter(name: &str) -> bool {
             | "report-failures-only"
             | "progress"
             | "no-progress"
+            | "raw"
             | "list-echo"
             | "no-list-echo"
             | "delete"
@@ -1348,6 +1494,8 @@ fn export_markdown_skills(
         }
     }
 
+    // [Review Fix #Skill6] Build parser metadata once rather than once per file.
+    let root = tos_core::agent::skill_markdown::command_tree::<crate::cli::ADriveCommand>();
     let mut files = Vec::new();
     let skills = export_plan
         .iter()
@@ -1366,7 +1514,7 @@ fn export_markdown_skills(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, skill_markdown(&skill, language))?;
+        fs::write(&path, skill_markdown(&skill, language, &root))?;
         files.push(path.display().to_string());
     }
 
@@ -1400,12 +1548,15 @@ fn skill_index_markdown(
     for skill in skills {
         domains.entry(&skill.domain).or_default().push(skill);
     }
+    let public_surface = public_adrive_example(&format!("{surface} "))
+        .trim()
+        .to_string();
     let mut body = match language {
         DocumentationLanguage::En => format!(
-            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{surface}` commands. Select a domain below, then use the nested command skill.\n\n"
+            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{public_surface}` commands. Select a domain below, then use the nested command skill.\n\n"
         ),
         DocumentationLanguage::Zh => format!(
-            "# {surface} Skills\n\n当用户需要操作 `{surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
+            "# {surface} Skills\n\n当用户需要操作 `{public_surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
         ),
     };
     for (domain, skills) in domains {
@@ -1417,109 +1568,128 @@ fn skill_index_markdown(
             };
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
-                skill.name, skill.domain, skill.name, skill.command, description
+                skill.name,
+                skill.domain,
+                skill.name,
+                public_adrive_example(&skill.command),
+                description
             ));
         }
         body.push('\n');
     }
-    body
+    let description = match language {
+        DocumentationLanguage::En => format!(
+            "Use when operating {public_surface}; select a command reference from this index."
+        ),
+        DocumentationLanguage::Zh => {
+            format!("当用户需要使用 {public_surface} 时，先从此索引选择对应命令。")
+        }
+    };
+    tos_core::agent::skill_markdown::frontmatter(&format!("{surface}-commands"), &description)
+        + &body
 }
 
-fn skill_markdown(skill: &SkillDefinition, language: DocumentationLanguage) -> String {
-    let examples = if skill.examples.is_empty() {
-        match language {
-            DocumentationLanguage::En => {
-                "- Run with `--describe` first to inspect the command contract.".to_string()
-            }
-            DocumentationLanguage::Zh => {
-                "- 先运行 `--describe` 检查命令契约，再决定是否执行。".to_string()
+fn skill_markdown(
+    skill: &SkillDefinition,
+    language: DocumentationLanguage,
+    root: &clap::Command,
+) -> String {
+    use tos_core::agent::skill_markdown::{render, CommandSkill};
+
+    let is_chinese = matches!(language, DocumentationLanguage::Zh);
+    let description = if is_chinese {
+        localized_skill_description_zh(skill)
+    } else {
+        skill.description.clone()
+    };
+    // [Review Fix #Skill2] Resolve every displayed command at export time;
+    // canonical registry IDs and MCP names remain stable across entrypoints.
+    let public_command = public_adrive_example(&skill.command);
+    let examples = skill
+        .examples
+        .iter()
+        .map(|example| public_adrive_example(example))
+        .collect::<Vec<_>>();
+    let schema = localized_input_schema(&skill.input_schema, language);
+    let mut markdown = render(
+        &CommandSkill {
+            name: &skill.name,
+            command: &skill.command,
+            public_command: &public_command,
+            description: &description,
+            risk: &skill.risk_level,
+            schema: &schema,
+            examples: &examples,
+            is_chinese,
+        },
+        root,
+    );
+    markdown.push_str(&share_skill_semantics_markdown(skill, language));
+    markdown
+}
+
+fn share_skill_semantics_markdown(
+    skill: &SkillDefinition,
+    language: DocumentationLanguage,
+) -> String {
+    let Some(mut described) =
+        crate::share_metadata::describe_share_command(&skill.internal_command)
+    else {
+        return String::new();
+    };
+    // [Review Fix #ShareExport1] Export the same localized routing/recovery contract as Describe instead of a separate stale copy.
+    if matches!(language, DocumentationLanguage::Zh) {
+        localize_adrive_auth_documentation_zh(&mut described);
+    }
+    let lines = described["semantics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let heading = if matches!(language, DocumentationLanguage::Zh) {
+        "行为说明"
+    } else {
+        "Semantics"
+    };
+    format!("\n## {heading}\n\n{}\n", lines.join("\n\n"))
+}
+
+#[cfg(test)]
+mod share_export_tests {
+    use super::*;
+
+    #[test]
+    fn exported_share_skills_include_localized_describe_semantics() {
+        let root = tos_core::agent::skill_markdown::command_tree::<crate::cli::ADriveCommand>();
+        let shares = skill_definitions()
+            .into_iter()
+            .filter(|skill| skill.internal_command.starts_with("ve-adrive share "))
+            .collect::<Vec<_>>();
+        // [Review Fix #ShareExport2] A removed registry leaf must not silently reduce the documentation regression's coverage.
+        assert_eq!(shares.len(), 9);
+        for skill in shares {
+            for language in [DocumentationLanguage::En, DocumentationLanguage::Zh] {
+                let markdown = skill_markdown(&skill, language, &root);
+                let mut described =
+                    crate::share_metadata::describe_share_command(&skill.internal_command).unwrap();
+                if matches!(language, DocumentationLanguage::Zh) {
+                    localize_adrive_auth_documentation_zh(&mut described);
+                }
+                for line in described["semantics"].as_array().unwrap() {
+                    assert!(
+                        markdown.contains(line.as_str().unwrap()),
+                        "{} {} omitted Describe semantics",
+                        skill.name,
+                        language.code()
+                    );
+                }
+                assert!(markdown.contains(&skill.name));
             }
         }
-    } else {
-        skill
-            .examples
-            .iter()
-            .map(|example| format!("- `{example}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let input_schema = localized_input_schema(&skill.input_schema, language);
-    let schema = serde_json::to_string_pretty(&input_schema).unwrap_or_else(|_| "{}".to_string());
-    match language {
-        DocumentationLanguage::En => format!(
-            r#"# {name}
-
-Use this skill when the user wants to run `{command}` with the Volcano Engine ADrive CLI.
-
-## Description
-
-{description}
-
-## Command
-
-`{command}`
-
-Risk level: `{risk_level}`
-
-## Inputs
-
-```json
-{schema}
-```
-
-## Examples
-
-{examples}
-
-## Execution
-
-Prefer `{public_command} --describe` or `{public_command} --dry-run --output json` before executing a command that writes or deletes data. Destructive commands must include the required `--force` and exact `--confirm` target.
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = skill.description,
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_adrive_command(&skill.command),
-        ),
-        DocumentationLanguage::Zh => format!(
-            r#"# {name}
-
-当用户需要通过火山引擎 ADrive CLI 运行 `{command}` 时使用此 Skill。
-
-## 说明
-
-{description}
-
-## 命令
-
-`{command}`
-
-风险等级：`{risk_level}`
-
-## 输入
-
-```json
-{schema}
-```
-
-## 示例
-
-{examples}
-
-## 执行建议
-
-执行会写入或删除数据的命令前，优先运行 `{public_command} --describe` 或 `{public_command} --dry-run --output json`。破坏性命令必须包含必需的 `--force` 和精确匹配目标的 `--confirm`。
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = localized_skill_description_zh(skill),
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_adrive_command(&skill.command),
-        ),
     }
 }
 
@@ -1529,14 +1699,7 @@ pub async fn handle_config_command(
     cmd: &ConfigCommand,
 ) -> Result<i32, CliError> {
     if global.describe {
-        // [Review Fix #ADrive-ConfigDescribe] Capabilities advertise describe
-        // support for this utility group, so group-level describe must not
-        // require a leaf subcommand.
-        output_result(
-            global,
-            &Envelope::success("ve-adrive config", describe_config_group()),
-        )?;
-        return Ok(0);
+        return handle_config_describe(global, cmd.action.as_ref());
     }
 
     let Some(action) = &cmd.action else {
@@ -1605,6 +1768,7 @@ pub async fn handle_config_command(
             let config_path = global.config_path();
             let config_dir = ConfigFile::config_dir_from_path(&config_path);
             let config = ConfigFile::load_from(&config_path)?;
+            validate_selected_share_origin(&config, &global.profile)?;
             // [Review Fix #9] Keep explicit credentials-path behavior aligned
             // across runtime, diagnostics, and config inspection.
             let credentials_path = global.existing_runtime_credentials_path()?;
@@ -1653,6 +1817,9 @@ pub async fn handle_config_command(
                     for eff in &effective {
                         if let Some(ref f) = eff.auth_mode {
                             push_traced_row(&mut rows, eff, "auth_mode", f);
+                        }
+                        if let Some(ref f) = eff.share_base_url {
+                            push_traced_row(&mut rows, eff, "share_base_url", f);
                         }
                         if let Some(ref f) = eff.auth_endpoint {
                             push_traced_row(&mut rows, eff, "auth_endpoint", f);
@@ -1758,6 +1925,26 @@ pub async fn handle_config_command(
             Ok(0)
         }
     }
+}
+
+fn handle_config_describe(
+    global: &GlobalArgs,
+    action: Option<&ConfigAction>,
+) -> Result<i32, CliError> {
+    // [Review Fix #Rebase4] Leading --describe dispatches here directly;
+    // preserve the requested action and keep config init/set read-only.
+    let command = match action {
+        Some(ConfigAction::Init { .. }) => "ve-adrive config init",
+        Some(ConfigAction::Show) => "ve-adrive config show",
+        Some(ConfigAction::Set { .. }) => "ve-adrive config set",
+        None => "ve-adrive config",
+    };
+    let mut description = describe_config_action(command).unwrap_or_else(describe_config_group);
+    if global.uses_chinese_documentation() {
+        localize_adrive_auth_documentation_zh(&mut description);
+    }
+    output_result(global, &Envelope::success(command, description))?;
+    Ok(0)
 }
 
 fn handle_adrive_credential_set(
@@ -2083,6 +2270,16 @@ fn describe_config_group() -> Value {
 /// Returns `None` when `command_path` is not an ADrive meta command handled by
 /// this module.
 pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
+    if let Some(mut description) = crate::share_metadata::describe_share_command(command_path) {
+        if let Some(row) = find_capability(command_path) {
+            description["examples"] = json!(row
+                .examples
+                .iter()
+                .map(|example| public_adrive_example(example))
+                .collect::<Vec<_>>());
+        }
+        return Some(description);
+    }
     // [Review Fix #ADriveZh7] Config actions bypass capability rows, so expose
     // their owned descriptions through the same Describe localization path.
     if let Some(description) = describe_config_action(command_path) {
@@ -2338,8 +2535,35 @@ fn describe_meta_examples(command_path: &str) -> Vec<String> {
     }
 }
 
+fn validate_selected_share_origin(config: &ConfigFile, profile_name: &str) -> Result<(), CliError> {
+    // [Review Fix #ShareOrigin2] Config inspection validates its selected origin without blocking other profiles or non-share operations.
+    if let Some(origin) = config
+        .profiles
+        .get(profile_name)
+        .and_then(|profile| profile.adrive.as_ref())
+        .and_then(|settings| settings.share_base_url.as_deref())
+    {
+        tos_core::infra::config::validate_share_base_url(origin)?;
+    }
+    Ok(())
+}
+
+fn redact_invalid_share_origin(effective: &mut EffectiveProfile) {
+    // [Review Fix #ShareOrigin2] Displaying another profile must not disclose credentials embedded in an invalid origin.
+    if let Some(field) = &mut effective.share_base_url {
+        if field
+            .value
+            .as_deref()
+            .is_some_and(|origin| tos_core::infra::config::validate_share_base_url(origin).is_err())
+        {
+            field.value = Some("[invalid share page origin]".into());
+        }
+    }
+}
+
 fn redact_adrive_effective(effective: EffectiveProfile) -> EffectiveProfile {
     let mut redacted = redact_effective(effective);
+    redact_invalid_share_origin(&mut redacted);
     for token in [&mut redacted.access_token, &mut redacted.refresh_token]
         .into_iter()
         .flatten()
@@ -2607,7 +2831,8 @@ async fn mcp_execute_typed_command(
         CliError::ValidationError(format!("{} arguments must be a JSON object", skill.name))
     })?;
     let execute = bool_field(object, "execute").unwrap_or(false);
-    let argv = build_mcp_typed_argv(global, &skill.internal_command, object)?;
+    let (prepared, password) = prepare_mcp_share_arguments(&skill.internal_command, object)?;
+    let argv = build_mcp_prepared_argv(global, &skill.internal_command, &prepared)?;
     if !execute {
         return Ok((
             json!({
@@ -2625,13 +2850,119 @@ async fn mcp_execute_typed_command(
                 .to_string(),
         ));
     }
-    let result = run_mcp_typed_argv(&skill.command, argv).await?;
+    let result = run_mcp_typed_argv(&skill.command, argv, password).await?;
     let is_error = result.exit_code.unwrap_or(1) != 0;
     let payload = serde_json::to_value(result).map_err(CliError::Json)?;
     Ok((payload, is_error))
 }
 
+#[cfg(test)]
 fn build_mcp_typed_argv(
+    global: &GlobalArgs,
+    command: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<Vec<String>, CliError> {
+    let (prepared, _password) = prepare_mcp_share_arguments(command, arguments)?;
+    build_mcp_prepared_argv(global, command, &prepared)
+}
+
+fn prepare_mcp_share_arguments(
+    command: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(serde_json::Map<String, Value>, Option<String>), CliError> {
+    let mut prepared = arguments.clone();
+    if !command.starts_with("ve-adrive share ") {
+        return Ok((prepared, None));
+    }
+    validate_mcp_share_selector(command, arguments)?;
+    let is_password_supported = crate::share_metadata::supports_password(command);
+    let explicit = match arguments.get("password") {
+        Some(Value::String(password)) if is_password_supported => {
+            super::share_password::validate_password(password)?;
+            Some(password.clone())
+        }
+        Some(_) => {
+            return Err(CliError::ValidationError(
+                "share MCP password must be a bounded string for a supported action".into(),
+            ))
+        }
+        None => None,
+    };
+    let url_password = if let Some(value) = arguments.get("share-url") {
+        let url = value
+            .as_str()
+            .ok_or_else(|| CliError::ValidationError("share-url must be a string".into()))?;
+        let parsed =
+            crate::domain::share_url::parse_share_url(url).map_err(super::common::map_ids_error)?;
+        prepared.insert("share-url".into(), json!(parsed.safe_url));
+        parsed.password
+    } else {
+        None
+    };
+    let password = if is_password_supported {
+        explicit.or(url_password)
+    } else {
+        None
+    };
+    if let Some(password) = &password {
+        super::share_password::validate_password(password)?;
+        prepared.insert("password-stdin".into(), json!(true));
+    }
+    if bool_field(arguments, "password-stdin") == Some(true) && password.is_none() {
+        return Err(CliError::ValidationError(
+            "MCP --password-stdin requires a virtual password or share URL pwd value".into(),
+        ));
+    }
+    prepared.remove("password");
+    Ok((prepared, password))
+}
+fn validate_mcp_share_selector(
+    command: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), CliError> {
+    if command == "ve-adrive share list" {
+        // [Review Fix #ShareList3] Metadata discovery needs no resource identity; execution and ordinary planning still do.
+        if bool_field(arguments, "describe") == Some(true)
+            && !arguments.contains_key("target")
+            && !arguments.contains_key("instance")
+        {
+            return Ok(());
+        }
+        return crate::domain::share_target::resolve_share_instance(
+            mcp_optional_selector(arguments, "target")?,
+            mcp_optional_selector(arguments, "instance")?,
+        )
+        .map(|_| ())
+        .map_err(super::common::map_ids_error);
+    }
+    if !matches!(
+        command,
+        "ve-adrive share get" | "ve-adrive share update" | "ve-adrive share cancel"
+    ) {
+        return Ok(());
+    }
+    let Some(value) = arguments.get("share-id") else {
+        return Ok(());
+    };
+    let target = value
+        .as_str()
+        .ok_or_else(|| CliError::ValidationError("share-id must be a string".into()))?;
+    let instance = mcp_optional_selector(arguments, "instance")?;
+    crate::domain::share_target::resolve_share_target(target, instance)
+        .map(|_| ())
+        .map_err(super::common::map_ids_error)
+}
+fn mcp_optional_selector<'a>(
+    arguments: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, CliError> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(CliError::ValidationError(format!("{key} must be a string"))),
+    }
+}
+fn build_mcp_prepared_argv(
     global: &GlobalArgs,
     command: &str,
     arguments: &serde_json::Map<String, Value>,
@@ -2642,8 +2973,26 @@ fn build_mcp_typed_argv(
     let mut argv = Vec::new();
     push_mcp_global_args(global, arguments, &mut argv)?;
     push_mcp_public_command_path(command, &mut argv);
+    push_mcp_auth_mode(arguments, &mut argv)?;
     push_mcp_command_args(row, arguments, &mut argv)?;
     Ok(argv)
+}
+
+fn push_mcp_auth_mode(
+    arguments: &serde_json::Map<String, Value>,
+    argv: &mut Vec<String>,
+) -> Result<(), CliError> {
+    if let Some(mode) = arguments.get("auth_mode") {
+        let mode = mode
+            .as_str()
+            .filter(|mode| matches!(*mode, "aksk" | "oauth" | "unified"))
+            .ok_or_else(|| {
+                CliError::ValidationError("auth_mode must be aksk, oauth or unified".into())
+            })?;
+        // [Review Fix #ShareReceiveMcp1] The unified entrypoint parses ADrive auth flags after the public command path.
+        argv.extend(["--auth-mode".into(), mode.into()]);
+    }
+    Ok(())
 }
 
 fn push_mcp_public_command_path(command: &str, argv: &mut Vec<String>) {
@@ -2674,6 +3023,7 @@ fn push_mcp_global_args(
             .unwrap_or(&global.profile)
             .to_string(),
     );
+    push_mcp_environment_args(global, arguments, argv);
     for (field, flag, fallback) in [
         ("region", "--region", global.region.as_deref()),
         ("endpoint", "--endpoint", global.endpoint.as_deref()),
@@ -2696,26 +3046,38 @@ fn push_mcp_global_args(
     Ok(())
 }
 
+fn push_mcp_environment_args(
+    global: &GlobalArgs,
+    arguments: &serde_json::Map<String, Value>,
+    argv: &mut Vec<String>,
+) {
+    for (field, flag, fallback) in [
+        ("config_path", "--config-path", global.config_path.as_ref()),
+        (
+            "credentials_path",
+            "--credentials-path",
+            global.credentials_path.as_ref(),
+        ),
+    ] {
+        if let Some(value) = string_field(arguments, field)
+            .map(str::to_owned)
+            .or_else(|| fallback.map(|path| path.display().to_string()))
+        {
+            argv.push(flag.into());
+            argv.push(value);
+        }
+    }
+    if bool_field(arguments, "yes").unwrap_or(global.yes) {
+        argv.push("--yes".into());
+    }
+}
+
 fn push_mcp_command_args(
     row: &CapabilityRow,
     arguments: &serde_json::Map<String, Value>,
     argv: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let reserved = [
-        "execute", "output", "profile", "region", "endpoint", "dry_run", "describe", "verbose",
-        "quiet",
-    ];
-    for key in arguments.keys() {
-        if reserved.contains(&key.as_str()) {
-            continue;
-        }
-        if !row.parameters.iter().any(|param| param.name == key) {
-            return Err(CliError::ValidationError(format!(
-                "unknown argument '{}' for MCP tool '{}'",
-                key, row.command
-            )));
-        }
-    }
+    validate_mcp_argument_names(row, arguments)?;
     for parameter in row
         .parameters
         .iter()
@@ -2723,7 +3085,7 @@ fn push_mcp_command_args(
     {
         if let Some(value) = arguments.get(parameter.name) {
             push_mcp_argument_value(argv, None, value)?;
-        } else if parameter.required {
+        } else if parameter.required && !bool_field(arguments, "describe").unwrap_or(false) {
             return Err(CliError::ValidationError(format!(
                 "missing required argument '{}' for MCP tool '{}'",
                 parameter.name, row.command
@@ -2739,7 +3101,18 @@ fn push_mcp_command_args(
             continue;
         };
         let flag = format!("--{}", parameter.name.replace('_', "-"));
-        if is_boolean_parameter(parameter.name) {
+        if row.command.starts_with("ve-adrive share ") && parameter.name == "require-login" {
+            let is_enabled = value
+                .as_bool()
+                .ok_or_else(|| CliError::ValidationError("require-login must be boolean".into()))?;
+            argv.push(flag);
+            argv.push(is_enabled.to_string());
+            continue;
+        }
+        // [Review Fix #ShareMcpCheckpoint1] Share download takes a checkpoint filename; cp retains its boolean switch.
+        if is_boolean_parameter(parameter.name)
+            && !(row.command == "ve-adrive share download" && parameter.name == "checkpoint")
+        {
             if value.as_bool().unwrap_or(false) {
                 argv.push(flag);
             }
@@ -2750,7 +3123,95 @@ fn push_mcp_command_args(
     Ok(())
 }
 
+fn validate_mcp_argument_names(
+    row: &CapabilityRow,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), CliError> {
+    if row.command == "ve-adrive share view" && arguments.contains_key("raw") {
+        return Err(CliError::ValidationError(
+            "share view MCP supports structured previews only; --raw is CLI-only".into(),
+        ));
+    }
+    let reserved = [
+        "execute",
+        "output",
+        "profile",
+        "auth_mode",
+        "region",
+        "endpoint",
+        "dry_run",
+        "describe",
+        "verbose",
+        "quiet",
+        "config_path",
+        "credentials_path",
+        "yes",
+    ];
+    for key in arguments.keys() {
+        if reserved.contains(&key.as_str()) {
+            continue;
+        }
+        if !row.parameters.iter().any(|param| param.name == key) {
+            return Err(CliError::ValidationError(format!(
+                "unknown argument '{}' for MCP tool '{}'",
+                key, row.command
+            )));
+        }
+    }
+    // [Review Fix #ShareMcpSelectors1] Conflicting target forms must be rejected before a positional string can be interpreted as a CLI flag.
+    if row.command == "ve-adrive share create"
+        && arguments.contains_key("target")
+        && ["instance", "space", "folder", "file"]
+            .iter()
+            .any(|selector| arguments.contains_key(*selector))
+    {
+        return Err(CliError::ValidationError(
+            "share target conflicts with explicit selectors".into(),
+        ));
+    }
+    if row.command.starts_with("ve-adrive share ") {
+        for parameter in row.parameters {
+            if let Some(value) = arguments.get(parameter.name) {
+                validate_share_mcp_parameter(row.command, parameter.name, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+fn validate_share_mcp_parameter(command: &str, name: &str, value: &Value) -> Result<(), CliError> {
+    let schema = crate::share_metadata::parameter_schema(command, name);
+    let is_valid = match schema["type"].as_str() {
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("integer") => value.as_i64().is_some_and(|number| {
+            // [Review Fix #ShareTypedMaximum1] Planned MCP arguments must satisfy the same upper bounds as Clap execution.
+            schema["minimum"]
+                .as_i64()
+                .is_none_or(|minimum| number >= minimum)
+                && schema["maximum"]
+                    .as_i64()
+                    .is_none_or(|maximum| number <= maximum)
+        }),
+        Some("array") => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string)),
+        _ => false,
+    };
+    if !is_valid {
+        return Err(CliError::ValidationError(format!(
+            "invalid typed share MCP argument: {name}"
+        )));
+    }
+    Ok(())
+}
+
 fn is_positional_parameter(command: &str, name: &str) -> bool {
+    if command.starts_with("ve-adrive share ") {
+        return matches!(
+            name,
+            "target" | "share-id" | "share-url" | "destination-dir"
+        );
+    }
     matches!(
         (command, name),
         (
@@ -2805,25 +3266,54 @@ fn value_to_cli_string(value: &Value) -> Result<String, CliError> {
 async fn run_mcp_typed_argv(
     command: &str,
     argv: Vec<String>,
+    password: Option<String>,
 ) -> Result<McpCommandExecution, CliError> {
     let exe = std::env::current_exe()?;
-    let output = timeout(
-        Duration::from_secs(300),
-        TokioCommand::new(exe).args(&argv).output(),
-    )
+    let timeout_seconds = if command.contains("share download") {
+        3600
+    } else {
+        300
+    };
+    let output = timeout(Duration::from_secs(timeout_seconds), async {
+        let mut child = TokioCommand::new(exe)
+            .args(&argv)
+            .kill_on_drop(true)
+            .stdin(if password.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(password) = &password {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                CliError::ValidationError("MCP password stdin unavailable".into())
+            })?;
+            stdin.write_all(password.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.shutdown().await?;
+        }
+        child.wait_with_output().await.map_err(CliError::Io)
+    })
     .await
     .map_err(|_| {
         CliError::ValidationError(format!(
-            "MCP typed command '{}' timed out after 300 seconds",
-            command
+            "MCP typed command timed out after {timeout_seconds} seconds"
         ))
     })??;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if let Some(password) = password.filter(|value| !value.is_empty()) {
+        // [Review Fix #ShareSecret3] Stdout contains business paths and IDs; the child owns field-aware payload redaction.
+        stderr = stderr.replace(&password, "***");
+    }
     Ok(McpCommandExecution {
-        command: command.to_string(),
+        command: command.into(),
         argv,
         exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout,
+        stderr,
     })
 }
 
@@ -2937,7 +3427,7 @@ fn completion_words() -> Vec<&'static str> {
     let mut words = capabilities()
         .iter()
         .filter_map(|row| row.command.strip_prefix("ve-adrive "))
-        .filter_map(|suffix| suffix.split_whitespace().next())
+        .flat_map(|suffix| suffix.split_whitespace())
         .collect::<Vec<_>>();
     words.sort_unstable();
     words.dedup();
@@ -3521,7 +4011,13 @@ fn principles_check() -> DoctorCheck {
         .collect();
     let destructive_without_force: Vec<&str> = rows
         .iter()
-        .filter(|row| row.destructive && !row.supports_force)
+        // [Review Fix #Rebase5] Recognize only the registered cancellation
+        // --yes gate; all other destructive rows still require force support.
+        .filter(|row| {
+            row.destructive
+                && !row.supports_force
+                && !crate::share_metadata::supports_yes(row.command)
+        })
         .map(|row| row.command)
         .collect();
     let skill_domains = skill_definitions()
@@ -3603,6 +4099,293 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[test]
+    fn share_mcp_management_uri_omits_instance_and_rejects_conflicts() {
+        for action in ["get", "update", "cancel"] {
+            let command = format!("ve-adrive share {action}");
+            let mut arguments = json!({"share-id":"adrive://inst/s"});
+            if action == "update" {
+                arguments["name"] = json!("New");
+            }
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                &command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv.iter().any(|value| value == "adrive://inst/s"));
+            assert!(!argv.iter().any(|value| value == "--instance"));
+            let schema = skill_input_schema(find_capability(&command).unwrap());
+            assert!(!schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("instance")));
+            arguments["instance"] = json!("other");
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                &command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+            arguments["share-id"] = json!("s");
+            arguments.as_object_mut().unwrap().remove("instance");
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                &command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn share_mcp_explicit_oauth_selects_recipient_profile() {
+        for action in ["inspect", "files", "download"] {
+            let command = format!("ve-adrive share {action}");
+            let mut arguments = json!({"share-url":"http://pages.test/share/s","auth_mode":"oauth","profile":"receiver"});
+            if action == "download" {
+                arguments["destination-dir"] = json!("downloads");
+            }
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                &command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv.windows(2).any(|pair| pair == ["--auth-mode", "oauth"]));
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair == ["--profile", "receiver"]));
+            let schema = skill_input_schema(find_capability(&command).unwrap());
+            assert!(schema["properties"]["auth_mode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("oauth")));
+            arguments["auth_mode"] = json!("invalid-secret-mode");
+            let error = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                &command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("invalid-secret-mode"));
+        }
+    }
+
+    #[test]
+    fn share_mcp_list_describe_does_not_require_instance_selection() {
+        let arguments = json!({"describe":true});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share list",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.iter().any(|value| value == "--describe"));
+        assert!(!argv.iter().any(|value| value == "--instance"));
+    }
+
+    #[test]
+    fn share_mcp_list_accepts_instance_uri_and_validates_selection() {
+        let command = "ve-adrive share list";
+        for arguments in [
+            json!({"target":"adrive://inst"}),
+            json!({"instance":"inst"}),
+            json!({"target":"adrive://inst/","instance":"inst"}),
+        ] {
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap()
+            )
+            .is_ok());
+        }
+        for arguments in [
+            json!({}),
+            json!({"target":"adrive://inst","instance":"other"}),
+            json!({"target":"adrive://inst/share-id"}),
+            json!({"target":5}),
+            json!({"instance":false}),
+        ] {
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+        }
+        let schema = skill_input_schema(find_capability(command).unwrap());
+        assert_eq!(schema["properties"]["target"]["type"], "string");
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("instance")));
+    }
+
+    #[test]
+    fn share_view_mcp_uses_structured_preview_and_rejects_cli_raw_mode() {
+        let command = "ve-adrive share view";
+        let schema = skill_input_schema(find_capability(command).unwrap());
+        assert!(schema["properties"].get("raw").is_none());
+        let arguments = json!({"share-url":"http://pages.test/share/s", "raw":true});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            command,
+            arguments.as_object().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn share_mcp_schema_preserves_array_integer_boolean_and_file_checkpoint() {
+        let list = skill_input_schema(find_capability("ve-adrive share list").unwrap());
+        assert_eq!(list["properties"]["creator"]["type"], "array");
+        assert_eq!(list["properties"]["limit"]["type"], "integer");
+        let download = skill_input_schema(find_capability("ve-adrive share download").unwrap());
+        assert_eq!(download["properties"]["checkpoint"]["type"], "string");
+        assert_eq!(download["properties"]["password"]["writeOnly"], true);
+    }
+    #[test]
+    fn share_mcp_keeps_explicit_false_and_removes_url_pwd() {
+        let arguments = json!({"share-id":"s","instance":"inst","require-login":false});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share update",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--require-login", "false"]));
+        let receiver = json!({"share-url":"https://x.test/share/s?pwd=secret"});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share files",
+            receiver.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(!argv.join(" ").contains("secret"));
+        assert!(argv.contains(&"--password-stdin".into()));
+    }
+
+    #[test]
+    fn share_mcp_password_precedence_and_validation_are_explicit() {
+        let arguments =
+            json!({"share-url":"https://x.test/share/s?pwd=url-secret","password":"stdin-secret"});
+        let (prepared, password) =
+            prepare_mcp_share_arguments("ve-adrive share files", arguments.as_object().unwrap())
+                .unwrap();
+        assert_eq!(password.as_deref(), Some("stdin-secret"));
+        assert_eq!(prepared["share-url"], "https://x.test/share/s");
+        assert!(prepared.get("password").is_none());
+        for arguments in [
+            json!({"share-url":"https://x.test/share/s?pwd=url-secret","password":5}),
+            json!({"share-url":"https://x.test/share/s","password-stdin":true}),
+        ] {
+            assert!(prepare_mcp_share_arguments(
+                "ve-adrive share files",
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn cp_mcp_checkpoint_remains_a_boolean_switch() {
+        let arguments =
+            json!({"source":"./a","destination":"adrive://i/s/a","checkpoint":true,"force":false});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive cp",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.contains(&"--checkpoint".into()));
+        assert!(!argv.contains(&"true".into()));
+        assert!(!argv.contains(&"false".into()));
+        assert_eq!(
+            skill_input_schema(find_capability("ve-adrive cp").unwrap())["properties"]
+                ["checkpoint"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn share_completion_contains_group_and_all_nine_actions() {
+        let words = completion_words();
+        for expected in [
+            "share", "create", "get", "list", "update", "cancel", "inspect", "files", "view",
+            "download",
+        ] {
+            assert!(words.contains(&expected), "missing {expected}");
+        }
+    }
+    #[test]
+    fn share_mcp_rejects_conflicting_create_selectors_before_argv() {
+        let arguments = json!({"target":"--yes","instance":"inst","space":"space","folder":"docs"});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share create",
+            arguments.as_object().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn share_mcp_rejects_offset_above_schema_maximum() {
+        let arguments = json!({"instance":"inst","creator":["u"],"offset":10001});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share list",
+            arguments.as_object().unwrap()
+        )
+        .is_err());
+    }
+    #[tokio::test]
+    async fn config_show_rejects_invalid_selected_share_origin_without_echo() {
+        let directory =
+            std::env::temp_dir().join(format!("share-show-review-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[default.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+        )
+        .unwrap();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            output: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        let result = handle_config_command(
+            &global,
+            &ConfigCommand {
+                action: Some(ConfigAction::Show),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!result.unwrap_err().to_string().contains("must-not-echo"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn config_display_masks_invalid_unused_origin_metadata() {
+        let directory =
+            std::env::temp_dir().join(format!("share-show-mask-review-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(
+            &path,
+            "[other.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+        )
+        .unwrap();
+        let config = ConfigFile::load_from(&path).unwrap();
+        let effective = config
+            .get_effective_profile("other", Binary::Adrive)
+            .unwrap();
+        assert!(!serde_json::to_string(&redact_adrive_effective(effective))
+            .unwrap()
+            .contains("must-not-echo"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     fn missing_chinese(context: &str, source: &str) -> Option<String> {
         let chinese = adrive_metadata_translation_zh(source);
         let is_missing = chinese.is_none_or(|value| {
@@ -3794,8 +4577,12 @@ mod tests {
         {
             let description =
                 crate::handler::high_level::describe_high_level_command_path(row.command)
+                    .map(|description| {
+                        serde_json::to_value(description).expect("serialize Describe")
+                    })
+                    .or_else(|| crate::share_metadata::describe_share_command(row.command))
                     .expect("high-level registry command has Describe metadata");
-            let document = serde_json::to_value(description).expect("serialize Describe");
+            let document = description;
             missing.extend(missing_describe_translations(row.command, &document));
         }
         assert!(

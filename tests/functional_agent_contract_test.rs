@@ -226,3 +226,140 @@ fn low_level_layer_filter_keeps_functional_capabilities() {
         );
     }
 }
+
+#[test]
+fn share_parse_errors_never_echo_query_passwords() {
+    let output = cli(&[
+        "ve-adrive",
+        "share",
+        "files",
+        "https://x.test/share/s",
+        "https://x.test/share/s?pwd=never-echo",
+        "--output",
+        "json",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("never-echo"), "{stderr}");
+    let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(error["error"]["code"], "ValidationError");
+    assert!(error["error"]["suggested_action"]
+        .as_str()
+        .unwrap()
+        .contains("--help"));
+}
+
+#[test]
+fn share_unknown_action_and_flag_errors_have_canonical_secret_free_commands() {
+    for args in [
+        vec![
+            "ve-adrive",
+            "share",
+            "https://x.test/share/s?pwd=fixture-leak",
+            "--output",
+            "json",
+        ],
+        vec![
+            "ve-adrive",
+            "share",
+            "files",
+            "https://x.test/share/s",
+            "--unknown=https://x.test/share/s?pwd=fixture-leak",
+            "--output",
+            "json",
+        ],
+    ] {
+        let output = cli(&args);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("fixture-leak"), "{stderr}");
+        let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert!(matches!(
+            error["command"].as_str(),
+            Some("ve-adrive share" | "ve-adrive share files")
+        ));
+        assert_eq!(error["error"]["code"], "ValidationError");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn share_sigint_restores_real_terminal_echo_during_and_after_password() {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/share_pty_regression.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn share_describe_recovers_incomplete_positionals_without_io() {
+    for action in [
+        "create", "get", "list", "update", "cancel", "inspect", "files", "view", "download",
+    ] {
+        let output = cli(&[
+            "ve-adrive",
+            "share",
+            action,
+            "--describe",
+            "--output",
+            "json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            data(&output)["command"],
+            format!("ve-adrive share {action}")
+        );
+    }
+}
+
+#[test]
+fn share_group_describe_is_structured_and_unauthenticated() {
+    let output = cli(&["ve-adrive", "share", "--describe", "--output", "json"]);
+    assert!(output.status.success());
+    assert_eq!(data(&output)["kind"], "command_group");
+    assert_eq!(data(&output)["subcommands"].as_array().unwrap().len(), 9);
+}
+
+#[test]
+fn adrive_root_help_lists_all_share_actions_in_both_languages() {
+    for language in ["en", "zh"] {
+        let output = cli(&["ve-adrive", "--help", "--language", language]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for action in [
+            "create", "get", "list", "update", "cancel", "inspect", "files", "view", "download",
+        ] {
+            assert!(
+                stdout.contains(&format!("share {action}")),
+                "language={language}, missing {action}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bare_share_group_help_uses_requested_language_and_unified_prefix() {
+    let output = cli(&["ve-adrive", "share", "--language", "zh"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("取消分享链接"));
+    assert!(stdout.contains("ve-storage-uni-cli ve-adrive share"));
+    assert!(!stdout.contains("Cancel a share link"));
+}

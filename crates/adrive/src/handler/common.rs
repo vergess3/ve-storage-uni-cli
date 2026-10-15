@@ -1047,6 +1047,9 @@ pub fn adrive_error_guidance(
     command_path: &str,
 ) -> AdriveErrorGuidance {
     let semantics = error.agent_semantics();
+    if semantics.code == "share_result_unknown" {
+        return guidance("Do not automatically retry this share mutation; reconcile its outcome with share get or share list",Some("ve-adrive share get <share-id> --instance <instance-id>"),None);
+    }
     let mode = error_auth_mode(global, requested_mode);
     if mode == Some(AuthMode::Oauth)
         && semantics.code == "oauth_instance_required"
@@ -1582,14 +1585,13 @@ fn render_value(
             println!("{}", format_xml(value).map_err(CliError::Json)?);
         }
         OutputFormat::Table => {
-            let payload = unwrap_envelope_data(value);
-            println!("{}", render_table(payload, columns));
+            println!("{}", render_table_for_output(global, value, columns));
             if let Some(footer) = envelope_footer(value) {
                 println!("{}", footer);
             }
         }
         OutputFormat::Csv => {
-            let payload = unwrap_envelope_data(value);
+            let payload = tabular_payload(value);
             println!("{}", render_csv(payload, columns));
         }
         OutputFormat::Markdown => {
@@ -1599,7 +1601,66 @@ fn render_value(
     Ok(())
 }
 
+fn render_table_for_output(
+    global: &GlobalArgs,
+    value: &Value,
+    columns: Option<&'static [&'static str]>,
+) -> String {
+    let has_query = global
+        .query
+        .as_deref()
+        .is_some_and(|query| !query.trim().is_empty());
+    if !has_query {
+        if let Some(rendered) = render_share_download_table(value) {
+            return rendered;
+        }
+    }
+    render_table(tabular_payload(value), columns)
+}
+
+fn render_share_download_table(value: &Value) -> Option<String> {
+    if !is_envelope_shape(value) || value.get("command")?.as_str()? != "ve-adrive share download" {
+        return None;
+    }
+    let transfer = value.get("data")?;
+    transfer.get("Files")?.as_array()?;
+    let completed = transfer["Summary"]["Completed"].as_u64().unwrap_or(0);
+    let skipped = transfer["Summary"]["Skipped"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(completed);
+    // [Review Fix #ShareProgress3] Match cp's default summary instead of printing the entire manifest; preserve file details in JSON and explicit projections.
+    let summary_fields = serde_json::json!({
+        "operation":"download",
+        "status":if transfer["Complete"] == true {"succeeded"} else if completed > 0 {"partial_failure"} else {"failed"},
+        "complete":transfer["Complete"], "plan_complete":transfer["PlanComplete"],
+        "checkpoint_available":transfer["CheckpointAvailable"],
+        "issuance_outcome_unknown":transfer["IssuanceOutcomeUnknown"],
+        "summary":{"total":transfer["Summary"]["Total"], "succeeded":completed-skipped,
+            "failed":transfer["Summary"]["Failed"], "skipped":skipped, "pending":transfer["Summary"]["Pending"]}
+    });
+    // [Review Fix #ShareDownloadDisplay4] Copy envelope metadata without duplicating the potentially large file list before replacing its payload.
+    let summary_metadata = value
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "data")
+        .map(|(key, field)| (key.clone(), field.clone()))
+        .collect();
+    let mut summary = Value::Object(summary_metadata);
+    summary["data"] = summary_fields;
+    Some(render_table(tabular_payload(&summary), None))
+}
+
 // ─── Envelope Helpers ───────────────────────────────────────────────────────
+
+fn tabular_payload(value: &Value) -> &Value {
+    // [Review Fix #ShareFailureTable1] A failed aggregate can have an empty file list; retain the envelope so denial details and recovery state remain visible.
+    if is_envelope_shape(value) && value.get("success").and_then(Value::as_bool) == Some(false) {
+        value
+    } else {
+        unwrap_envelope_data(value)
+    }
+}
 
 fn unwrap_envelope_data(value: &Value) -> &Value {
     if is_envelope_shape(value) {
@@ -1733,6 +1794,10 @@ fn pick_array_payload<'a>(
     let Value::Object(map) = value else {
         return None;
     };
+    // [Review Fix #ShareTable1] A share's own identity marks a detail result; collapsing its FilePathList would hide delivery fields.
+    if columns.is_none() && map.contains_key("ShareID") {
+        return None;
+    }
     if let Some(columns) = columns {
         let mut empty_candidate = None;
         for candidate in map.values().filter_map(Value::as_array) {
@@ -2555,6 +2620,58 @@ auth_mode = "aksk"
     }
 
     #[test]
+    fn share_detail_table_keeps_delivery_fields_with_populated_or_empty_paths() {
+        for paths in [json!(["docs/report.pdf"]), json!([])] {
+            let response = json!({
+                "ShareID":"share-fixture",
+                "ShareUrl":"http://pages.example.test/share/share-fixture",
+                "SharePwd":"fixture-delivery-password",
+                "FilePathList":paths,
+            });
+            let rendered = render_table(&response, None);
+            for expected in [
+                "ShareID",
+                "share-fixture",
+                "ShareUrl",
+                "http://pages.example.test/share/share-fixture",
+                "SharePwd",
+                "fixture-delivery-password",
+                "FilePathList",
+            ] {
+                assert!(rendered.contains(expected), "missing {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn share_detail_csv_keeps_delivery_fields_and_explicit_path_query_shape() {
+        let response = json!({
+            "ShareID":"share-fixture",
+            "ShareUrl":"http://pages.example.test/share/share-fixture",
+            "FilePathList":["docs/report.pdf"],
+        });
+        let rendered = render_csv(&response, None);
+        assert!(rendered.contains("ShareID,share-fixture"));
+        assert!(rendered.contains("ShareUrl,http://pages.example.test/share/share-fixture"));
+        assert!(rendered.contains("FilePathList,docs/report.pdf"));
+        let selected = render_table(&response["FilePathList"], None);
+        assert!(selected.contains("docs/report.pdf"));
+        assert!(!selected.contains("ShareID"));
+    }
+
+    #[test]
+    fn share_collection_table_still_renders_item_columns() {
+        let response = json!({
+            "Items":[{"ShareID":"share-fixture","ShareUrl":"http://pages.test/share/s"}],
+            "Total":1,
+        });
+        let rendered = render_table(&response, None);
+        assert!(rendered.contains("ShareID"));
+        assert!(rendered.contains("http://pages.test/share/s"));
+        assert!(!rendered.contains("field"));
+    }
+
+    #[test]
     fn table_output_uses_declared_columns_for_empty_payloads() {
         let rendered = render_table(
             &json!({
@@ -2602,6 +2719,59 @@ auth_mode = "aksk"
         }));
 
         assert_eq!(footer, Some("Total: 2 (next_marker=marker-1)".to_string()));
+    }
+
+    #[test]
+    fn failed_tabular_output_keeps_errors_and_transfer_summary() {
+        for files in [json!([]), json!([{"Path":"a","Status":"failed"}])] {
+            let envelope = json!({"command":"ve-adrive share download","status":"failed","success":false,
+                "ec":"Forbidden.ShareDownloadDisabled","status_code":403,
+                "error":{"code":"Forbidden.ShareDownloadDisabled","message":"share API request failed"},
+                "data":{"Complete":false,"Summary":{"Completed":0,"Failed":1},"Files":files}});
+            for rendered in [
+                render_table(tabular_payload(&envelope), None),
+                render_csv(tabular_payload(&envelope), None),
+            ] {
+                assert!(rendered.contains("Forbidden.ShareDownloadDisabled"));
+                assert!(rendered.contains("share API request failed"));
+                assert!(
+                    rendered.contains("data.Summary.Completed")
+                        && rendered.contains("data.Complete")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn success_and_explicit_query_values_keep_existing_tabular_selection() {
+        let envelope = json!({"command":"ve-adrive ls","status":"success","success":true,"data":{"Files":[{"Name":"a"}]}});
+        assert_eq!(tabular_payload(&envelope), &envelope["data"]);
+        let selected = json!([{"Name":"a"}]);
+        assert_eq!(tabular_payload(&selected), &selected);
+    }
+
+    #[test]
+    fn default_download_table_keeps_empty_summary_and_query_keeps_its_projection() {
+        let envelope = json!({"command":"ve-adrive share download","status":"success","success":true,
+            "data":{"Complete":true,"Summary":{"Total":0,"Completed":0,"Failed":0,"Pending":0},"Files":[]}});
+        let global = GlobalArgs::default();
+        let rendered = render_table_for_output(&global, &envelope, None);
+        assert!(rendered.contains("complete") && rendered.contains("summary.total"));
+        assert!(rendered.contains("summary.succeeded") && rendered.contains("summary.skipped"));
+        assert!(!rendered.contains("LocalPath"));
+        let custom = GlobalArgs {
+            query: Some("@".into()),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            render_table_for_output(&custom, &envelope, None),
+            render_table(tabular_payload(&envelope), None)
+        );
+        let selected = json!([{"name":"one","result":"completed"}]);
+        assert_eq!(
+            render_table_for_output(&custom, &selected, None),
+            render_table(&selected, None)
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -44,6 +45,8 @@ use tos_core::infra::unified_credentials::{UnifiedCredentialProvider, UnifiedCre
 use super::rate_limiter::RateLimiter;
 use super::token_manager::OAuthTokenManager;
 use super::types::*;
+
+mod share;
 
 type HmacSha256 = Hmac<Sha256>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -174,8 +177,11 @@ struct ClientInner {
     endpoint: String,
     region: String,
     http: reqwest::Client,
+    share_http: reqwest::Client,
     max_retry_count: u32,
     request_trace: Arc<ServiceRequestTrace>,
+    // [Review Fix #ShareSubmissionBoundary2] Optional shared observation keeps existing public calls unchanged while reporting actual share-write attempts.
+    share_submission_observer: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -439,8 +445,11 @@ impl Client {
                 endpoint,
                 region,
                 http,
+                // [Review Fix #6] Share writes require a transport that cannot redirect/replay bodies.
+                share_http: share::build_share_http(&options)?,
                 max_retry_count,
                 request_trace: Arc::new(ServiceRequestTrace::default()),
+                share_submission_observer: None,
             }),
         })
     }
@@ -1518,7 +1527,7 @@ impl Client {
         };
         manager.validate_instance(&input.instance_id)?;
         let (access_token, user_id) = manager
-            .access_token_and_user_id(apply_refresh_window)
+            .access_token_and_user_id(apply_refresh_window, None)
             .await?;
         let user_id = user_id.ok_or_else(oauth_user_id_required_error)?;
         let mut request_input = input.clone();
@@ -1703,6 +1712,8 @@ impl Client {
                     exact_values.push(authorization.to_string());
                 }
                 exact_values.push(auth.access_key.clone());
+                // [Review Fix #4] Share service error codes may echo any attempt credential.
+                exact_values.push(auth.secret_key.clone());
                 if let Some(security_token) = auth.security_token.clone() {
                     exact_values.push(security_token);
                 }

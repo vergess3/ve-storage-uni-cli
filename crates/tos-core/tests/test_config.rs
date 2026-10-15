@@ -378,3 +378,61 @@ fn test_derive_tos_control_endpoint_from_data_endpoint() {
         None
     );
 }
+
+#[test]
+fn adrive_share_origin_is_nested_and_validated() {
+    let mut config = tos_core::infra::config::ConfigFile::default();
+    config
+        .set_by_path(
+            &["default", "adrive", "share_base_url"],
+            "https://pages.example.test",
+        )
+        .unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("share_base_url = \"https://pages.example.test\""));
+    config
+        .set_by_path(
+            &["default", "adrive", "share_base_url"],
+            "http://pages.example.test:8080",
+        )
+        .unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("share_base_url = \"http://pages.example.test:8080\""));
+    for origin in [
+        "https://u:secret@pages.test",
+        "http://u:secret@pages.test",
+        "http://pages.test/base/..",
+        "http:pages.example.test/base/..",
+        "http:/pages.example.test/base/..",
+        "https:pages.example.test/base/..",
+        "https:/pages.example.test/base/..",
+        "http:pages.example.test/base/../https://other.test",
+        "https:pages.example.test/base/../http://other.test",
+        "http:pages.example.test/path/http://",
+        "ftp://pages.test",
+        "https://pages.test/base",
+        "https://pages.test?pwd=secret",
+    ] {
+        let error = config
+            .set_by_path(&["default", "adrive", "share_base_url"], origin)
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+    }
+}
+
+#[test]
+fn unused_invalid_share_origin_does_not_block_other_profiles_or_binaries() {
+    use tos_core::infra::config::{Binary, ConfigFile};
+    let path = std::env::temp_dir().join(format!(
+        "share-origin-isolation-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path,"[good]\nregion='cn-beijing'\n[good.adrive]\nendpoint='https://api.example.test'\n[bad.adrive]\nshare_base_url='https://user:must-not-echo@pages.test'\n").unwrap();
+    let config =
+        ConfigFile::load_from(&path).expect("an unused origin must not affect config loading");
+    assert!(config.get_effective_profile("good", Binary::Tos).is_ok());
+    assert!(config.get_effective_profile("good", Binary::Adrive).is_ok());
+    // Unused page origins are metadata here; their consumer validates the chosen value.
+    assert!(config.get_effective_profile("bad", Binary::Adrive).is_ok());
+    std::fs::remove_file(path).unwrap();
+}
