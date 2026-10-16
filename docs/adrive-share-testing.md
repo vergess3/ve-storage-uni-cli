@@ -11,12 +11,15 @@ cargo build --locked --offline
 cargo build --manifest-path packaging/cargo/ve-adrive-cli/Cargo.toml --locked --offline
 cargo test -p ve-adrive-cli-core --locked --offline -- --test-threads=1
 python3 tests/share_download_regression.py
+python3 tests/share_dry_run_regression.py target/debug/ve-storage-uni-cli packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli
+python3 tests/share_password_regression.py target/debug/ve-storage-uni-cli packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli
+python3 tests/share_discovery_regression.py target/debug/ve-storage-uni-cli packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli
 python3 tests/share_range_regression.py target/debug/ve-storage-uni-cli packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli
 python3 tests/share_view_regression.py target/debug/ve-storage-uni-cli packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli
 SHARE_CLI="$PWD/packaging/cargo/ve-adrive-cli/target/debug/ve-adrive-cli"
 ```
 
-预期：Rust 测试通过；Python 报告两个入口 PASS。Python 只访问本地 HTTP 夹具，不访问云端，覆盖 dry-run、错误聚合、SIGINT、选择器保护、403、目录别名恢复及无效下载地址。
+预期：Rust 测试通过；Python 报告两个入口 PASS。Python 只访问本地 HTTP 夹具，不访问云端，覆盖完整只读规划、分页、恢复本地摘要、显式空密码、错误聚合、SIGINT、选择器保护、403、目录别名恢复及无效下载地址。MCP 回归通过实际 stdio RPC 核对下载工具的 readOnlyHint=false、默认离线 argv 规划，以及 execute=true/dry_run=true 的联网只读预演。
 
 ## 2. 文档与能力发现
 
@@ -35,7 +38,7 @@ SHARE_DOCS="$(mktemp -d)"
 "$SHARE_CLI" completion bash --output json
 ```
 
-预期：发现 9 个命令 `create/get/list/update/cancel/inspect/files/view/download`，对应 9 个 Skill。Describe 包含参数类型、风险、API 映射、输出结构和行为说明；list 暴露可选位置参数 `target` 和条件必填的 `instance`，说明实例 URI 与 flag 两种写法。导出的下载 Skill 包含相同中文域名、根目录与未知结果说明。补全包含分享命令。MCP 工具由同一注册表生成，名称为 `ve_adrive_share_*`；工具调用默认生成计划，`execute=true` 才执行，`describe=true` 可省略实例选择器。
+预期：发现 9 个命令 `create/get/list/update/cancel/inspect/files/view/download`，对应 9 个 Skill。Describe 包含参数类型、风险、API 映射、输出结构和行为说明；list 暴露可选位置参数 `target` 和条件必填的 `instance`，说明实例 URI 与 flag 两种写法。下载 Describe 保留真实执行 output_schema，另加 dry_run_output_schema；side_effects 说明实际下载会创建目录、临时文件、checkpoint/锁文件、显式覆盖，以及签发 URL 可能消耗下载次数。预演仅访问元数据且不写本地。导出的下载 Skill 包含相同中文规划、域名、根目录与未知结果说明。补全包含分享命令。MCP 工具由同一注册表生成，名称为 `ve_adrive_share_*`；工具调用默认生成计划，`execute=true` 才执行，`describe=true` 可省略实例选择器。
 
 ## 3. 云端准备
 
@@ -79,7 +82,7 @@ SHARE_URL="$(printf '%s' "$SHARE_CREATED" | python3 -c 'import json,sys; print(j
 
 默认权限按 PRD 为仅预览，对应 V1 的 `view`。本例会下载目录，因此创建时显式传 `--permission download`。更新时未传 permission 保留原权限。
 
-密码是服务端提取码：create/update 的 `--password-stdin` 把输入映射为 V1 `SharePwd`；分享者将链接和提取码交给接收者。接收者在 files/view/download 中使用同一参数输入该提取码，CLI 调用 `GetShareAccessToken`，由服务端校验后返回分享访问 token。inspect 只读取公开概况，不需要密码。PRD 尚未确认清除提取码语义，空输入不能作为已确认的清除操作。
+密码是服务端提取码：create/update 的 `--password-stdin` 把输入映射为 V1 `SharePwd`；分享者将链接和提取码交给接收者。接收者在 files/view/download 中使用同一参数输入该提取码，CLI 调用 `GetShareAccessToken`，由服务端校验后返回分享访问 token。inspect 只读取公开概况，不需要密码。显式输入移除末尾一个 LF/CRLF 后为空时校验失败（退出码 6），覆盖 EOF/LF/CRLF 三种空输入；空格原样保留。create/update 的 --dry-run 也读取并校验显式输入，省略该参数则 update 保留原密码。--help/--describe 不读取 stdin、配置或网络。PRD 尚未确认清除提取码语义，空输入不会清除密码。
 
 `--require-login` 映射为 V1 `RequireLogin`，控制接收者是否必须登录，不改变分享者创建和管理时的身份要求。false 允许按密码、权限等规则匿名接收；true 要求接收者登录。接收默认匿名，即使 profile 已配置 OAuth；默认 files/view/download 会拒绝 RequireLogin=true 的分享，保留服务端拒绝码（实测 Forbidden.ShareRequireLogin）；如果服务端允许读取概况，CLI 则返回 `share_login_required`。显式 `--auth-mode oauth` 在 inspect/files/view/download 中复用所选 `--profile`，沿用登录与刷新机制，不自动登录或切换身份。服务端验证登录、实例绑定、scope 和分享权限；auth status 有缓存 token 并不等于服务端必然允许访问。
 
@@ -89,9 +92,9 @@ SHARE_URL="$(printf '%s' "$SHARE_CREATED" | python3 -c 'import json,sys; print(j
 "$CLI" --profile receiver auth login --instance "$SHARE_INSTANCE"
 "$CLI" --profile receiver auth status
 "$CLI" --profile receiver share inspect "$SHARE_URL" --auth-mode oauth
-"$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --path "$SHARE_FOLDER/" --limit 1
+"$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --path "$SHARE_FOLDER/" --max-keys 1
 # 将上一页 data.NextMarker 赋给 NEXT_MARKER，再取下一页
-"$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --path "$SHARE_FOLDER/" --limit 1 --marker "$NEXT_MARKER"
+"$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --path "$SHARE_FOLDER/" --max-keys 1 --marker "$NEXT_MARKER"
 "$CLI" --profile receiver share download "$SHARE_URL" ./share-oauth-download --auth-mode oauth --recursive
 ```
 
@@ -99,19 +102,27 @@ SHARE_URL="$(printf '%s' "$SHARE_CREATED" | python3 -c 'import json,sys; print(j
 
 ```bash
 read -r -s -p '提取码: ' SHARE_PASSWORD; printf '\n'
-printf '%s\n' "$SHARE_PASSWORD" | "$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --password-stdin --limit 1
-printf '%s\n' "$SHARE_PASSWORD" | "$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --password-stdin --limit 1 --marker "$NEXT_MARKER"
+printf '%s\n' "$SHARE_PASSWORD" | "$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --password-stdin --max-keys 1
+printf '%s\n' "$SHARE_PASSWORD" | "$CLI" --profile receiver share files "$SHARE_URL" --auth-mode oauth --password-stdin --max-keys 1 --marker "$NEXT_MARKER"
 printf '%s\n' "$SHARE_PASSWORD" | "$CLI" --profile receiver share download "$SHARE_URL" ./share-oauth-download --auth-mode oauth --password-stdin --recursive
 unset SHARE_PASSWORD
 ```
 
-files 默认一页，`--limit` 对应 page size，`--marker` 对应上一页 NextMarker；IsTruncated=false 时结束。服务文档默认/最大 100，CLI 校验正数后透传；精确文件查询不分页。download 自动枚举分页。新的匿名/OAuth checkpoint 均记录实际 API；OAuth 还绑定选定 profile、模式和实际请求中可用的 user_id，续 token 时该身份上下文改变会拒绝继续。环境变量或仅 access token 凭据未提供 user_id 时只能绑定 API/profile/模式，CLI 不能确定跨恢复替换的未知主体 token 是否来自另一个账户，也不会解析 token 推断身份。旧匿名 checkpoint 只在 URL 推导 API 下迁移，原来自定义 API 未被记录时须新建任务。checkpoint 仅保留非敏感身份上下文，不含账户 token、分享 token 或密码。
+files 与 ls 一样列举当前层级，`--max-keys` 默认 1000，文件和目录合计不超过此上限；内部自动获取服务分页，直到达到上限或真正结束，服务单页较短也会继续。`--marker` 使用上次结果的 NextMarker 续取，IsTruncated=false 时结束；`--max-keys` 仅接受 1 至 2147483647 的整数，files 不支持 `--limit` 或其别名。精确文件查询返回一个文件且不分页。JSON/query 保留 Files、Folders、NextMarker、IsTruncated 字段名，内容为聚合、规范化后的当前层级结果；目录标记、自身标记和重复项统一处理，各格式的 Total 和 pagination.total_returned 均按逻辑条目计数。inspect 返回分享概况；文件详情通过 files 查询。download 自动枚举分页，不提供 `--max-keys`、`--marker`、`--limit`；管理侧 share list 继续使用原有 `--limit` 和 `--offset`。新的匿名/OAuth checkpoint 均记录实际 API；OAuth 还绑定选定 profile、模式和实际请求中可用的 user_id，续 token 时该身份上下文改变会拒绝继续。环境变量或仅 access token 凭据未提供 user_id 时只能绑定 API/profile/模式，CLI 不能确定跨恢复替换的未知主体 token 是否来自另一个账户，也不会解析 token 推断身份。旧匿名 checkpoint 只在 URL 推导 API 下迁移，原来自定义 API 未被记录时须新建任务。checkpoint 仅保留非敏感身份上下文，不含账户 token、分享 token 或密码。
 
-`share files` 默认 table/CSV 与 `ls` 使用相同五列：file_path、size、file_type、updated_at、is_folder，目录在前，空页也保留列头。当前目录和重复目录 marker 按 ls 规则规范化，表格 Total 统计展示行数。JSON 和显式 `--query` 保留既有服务原始数组、字段及分页契约。
+`share files` 默认 table/CSV 与 `ls` 使用相同五列：file_path、size、file_type、updated_at、is_folder，目录在前，空结果也保留列头。所有格式按 ls 规则统一规范化当前目录和重复目录 marker；表格 Total 与 JSON 的 pagination.total_returned 统计相同逻辑条目。JSON 和显式 `--query` 保留聚合、规范化后的 Files/Folders 元数据及续取字段。
 
 ## 4. 核心验收
 
-下载不传 `--path` 会选择全部分享根；单文件分享自动选中该文件，目录分享仍需 `--recursive`。`--path` 用于选择某个文件或子目录。预检查会先创建目录结构，后续申请下载地址被服务端拒绝时，可能只留下空目录。默认 table 与 cp 一样展示 total/succeeded/failed/skipped 汇总，并补充 pending；空结果也保留汇总。逐文件明细用 JSON 或显式 query 查看。JSON 的 Summary.Skipped 为恢复时复用的已验证完成文件数，包含在 Summary.Completed 中；表格 succeeded 为本次新增完成数。TTY 默认在 stderr 显示扫描和按文件计数的进度，--progress 强制开启（非TTY为普通文本行），--no-progress/--quiet 关闭；两个progress参数互斥。`Forbidden.ShareDownloadDisabled` 是分享策略禁止下载，应由分享者开启 `--permission download`。
+下载不传 `--path` 会选择全部分享根；单文件分享自动选中该文件，目录分享仍需 `--recursive`。`--path` 用于选择某个文件或子目录。预检查会先创建目录结构，后续申请下载地址被服务端拒绝时，可能只留下空目录。默认 table 与 cp 一样展示 total/succeeded/failed/skipped 汇总，并补充 pending；空结果也保留汇总。逐文件明细用 JSON 或显式 query 查看。JSON 的 Summary.Skipped 为恢复时复用的已验证完成文件数，包含在 Summary.Completed 中；表格 succeeded 为本次新增完成数。TTY 默认在 stderr 显示扫描和按文件计数的进度，--progress 强制开启（非TTY为普通文本行），--no-progress/--quiet 关闭；两个progress参数互斥。`Forbidden.ShareDownloadDisabled` 可能是分享权限禁止下载，也可能是下载次数配额耗尽；仅凭错误码无法区分。请分享者检查权限和配额，保留服务端错误码、HTTP 状态与 request ID。实际下载会创建目录、临时文件和指定时的 checkpoint/锁文件；--overwrite 校验通过后替换普通文件，签发 URL 可能消耗下载次数，即使后续传输失败。
+
+下载预演可在真实下载前执行：
+
+```bash
+"$SHARE_CLI" share download "$SHARE_URL" "$SHARE_LOCAL/downloads" --recursive --checkpoint "$SHARE_LOCAL/checkpoint.json" --dry-run --output json
+```
+
+预期：仅有分享 info/token/list/get 元数据请求，自动枚举全部分页及选中递归目录。`data.selection` 包含完整 `Manifest`（Roots、Files、Directories 与本地映射）、`PlanComplete=true`、`FileCount`、`DirectoryCount`、`TotalBytes`、`SkippedCount` 和 `Conflicts`。文件大小缺失或为负数时校验失败（退出码 6），不把未知大小当作零字节；显式 0 是有效空文件。完成的计划有本地冲突时退出 9，保留计划供查看。`DownloadsIssued=0`、`LocalWrites=false`；不签发下载 URL、不取内容、不创建目录/临时文件、不写 checkpoint/锁文件。`MetadataResponses` 仅统计收到的元数据响应，未统计网络尝试次数，因此 `NetworkRequests=null`。`SnapshotGuaranteed=false`，检查后远端和本地仍可能变化。恢复预演使用已保存清单，只读校验身份、远端元数据与已完成本地摘要，不加锁、不保存。预演不获取 checkpoint 锁，现有普通锁文件可能正被使用；实际执行需重新检查并加锁。OAuth 预演禁用自动刷新以免写凭据/认证锁；token 已过期、距到期 60 秒内或收到 401 时，先正常执行 `"$SHARE_CLI" --profile "$SHARE_PROFILE" share inspect "$SHARE_URL" --auth-mode oauth`，再重试。其他分享 dry-run 离线，create/update 显式密码输入仍须校验。--describe 始终无配置、网络和 stdin I/O。
 
 有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用 16MiB Range、默认 4 路并发，无需 checkpoint。用 `--checkpoint-threshold 64MB`、`--multipart-concurrency 8` 调整；当前文件的分片完成进度也写到 stderr。分片失败只重试该分片，复用同一下载 URL。无强 ETag/CRC64 时使用单次流式 GET，避免混合版本。checkpoint 仍是文件级恢复，不复用未完成文件的分片。
 
@@ -135,7 +146,7 @@ test -d "$SHARE_LOCAL/downloads/$SHARE_FOLDER/empty"
 "$SHARE_CLI" share download "$SHARE_URL" "$SHARE_LOCAL/downloads" --recursive --checkpoint "$SHARE_LOCAL/checkpoint.json" --resume --output json
 ```
 
-预期：两种 get 写法返回相同 ShareID 和 URL；两种 list 写法在相同过滤条件下返回相同分享条目和分页字段。list 的 URI 可带一个根目录斜杠，不能带 ShareID/空间/文件路径；update/cancel 也支持分享 URI，重复指定的 `--instance` 必须一致，`--by-name` 解析实例名称。下载和恢复都为 `Complete=true`、`Summary.Completed=1`、`Summary.Failed=0`；`cmp` 和 `test` 返回 0。空目录保留，精确文件查询只返回一个文件。`share files` 默认返回一页当前层；使用 `--limit 1` 检查 `NextMarker`，再传 `--marker` 取下一页，直到 `IsTruncated=false`。
+预期：两种 get 写法返回相同 ShareID 和 URL；两种 list 写法在相同过滤条件下返回相同分享条目和分页字段。list 的 URI 可带一个根目录斜杠，不能带 ShareID/空间/文件路径；update/cancel 也支持分享 URI，重复指定的 `--instance` 必须一致，`--by-name` 解析实例名称。下载和恢复都为 `Complete=true`、`Summary.Completed=1`、`Summary.Failed=0`；`cmp` 和 `test` 返回 0。空目录保留，精确文件查询只返回一个文件。`share files` 默认自动聚合至当前层 1000 个逻辑条目或结束；使用 `--max-keys 1` 检查 `NextMarker`，再传 `--marker` 继续，直到 `IsTruncated=false`，续取结果不应跳过条目。
 
 整个命令组的输入按资源范围保持一致：create 用文件/文件夹 URI 或显式选择器；list 用实例 URI 或 `--instance`；get/update/cancel 用分享 URI 或 ShareID 加 `--instance`；inspect/files/view/download 使用公开 HTTP(S) 分享 URL。接收支持 `/share/<ShareID>` 和 `/share/<ShareID>/`，只规范化末尾一个斜杠；两者是同一分享和恢复任务。目录下钻使用 `--path '完整目录前缀/'`，不追加到分享 URL 后面。对应信息同步在 `--help`、`--describe`、capabilities、Skill 和 MCP 中。
 
@@ -143,10 +154,20 @@ test -d "$SHARE_LOCAL/downloads/$SHARE_FOLDER/empty"
 
 | 用例 | 操作 | 预期 |
 | --- | --- | --- |
+| 合计上限与续取 | files 使用 `--max-keys 1` 列举含文件和目录的当前层，再传 NextMarker 继续 | 每次文件和目录合计不超过 1，续取无遗漏，结束时 IsTruncated=false |
+| 默认自动分页 | 本地夹具返回短服务分页，不传 max-keys | 自动聚合到 1000 个逻辑条目或真实结束，不因单页较短而提前停止 |
+| 空目录与目录标记 | files 查询空目录、包含自身目录及重复目录标记的列表 | 空结果列头稳定；所有格式按相同逻辑条目计数，无重复 |
+| 非法上限和旧参数 | files 使用 max-keys 为 0、负数、2147483648，或传 `--limit` | 参数校验失败且不发出网络请求；MCP 拒绝同样输入 |
+| 异常分页游标 | 本地夹具返回重复、循环游标，或缺少游标的截断结果 | 明确失败且有界退出，不挂起、不跳过尚未返回的条目 |
 | 单文件分享 | 对 `${SHARE_REMOTE}report.txt` 再 create；调用 files/view/download | 一条文件，下载落为 `report.txt`；记录新 ShareID 用于清理 |
 | 密码 | 创建时加 `--password-stdin`，接收时通过 stdin 提供正确/错误密码 | 正确密码成功，错误密码明确拒绝；inspect 不读取密码 |
 | 明确禁止下载 | 将当前分享 update 为 `--permission view`，再下载到新目录 | 退出码 5、403、`Forbidden.ShareDownloadDisabled`、`IssuanceOutcomeUnknown=false` |
-| 根目录与恢复 | 使用普通目录或自己配置的目录别名作为 destination/checkpoint | 正常下载；等价实际目录可恢复 |
+| 根目录与恢复 | 使用普通目录或自己配置的目录别名作为 destination/checkpoint | 正常下载；等价实际目录可恢复，macOS /tmp、/var 别名允许 |
+| 完整预演 | download 加 --recursive --dry-run，检查多页和空目录 | selection.Manifest、计数与总字节数完整；仅元数据请求，无目录/临时文件/checkpoint/锁写入 |
+| 预演冲突 | 不加 --overwrite，预先放置同名普通文件 | 退出 9，data 中保留完整计划和 selection.Conflicts |
+| 恢复本地变化 | 完成后改变本地文件大小或同大小内容，再 --resume（含 dry-run） | Conflict，退出 9；本地文件和 checkpoint 不变 |
+| 子路径链接 | 在下载后代路径放置符号链接/Windows reparse 点 | Conflict，退出 9；提示处理本地目标路径，不签发 URL |
+| 显式空密码 | create/update（含 dry-run）或接收时通过 --password-stdin 输入 EOF/LF/CRLF | 校验失败退出 6，不提交修改或交换分享 token；仅空格输入保留 |
 | 并发更新 | 保存 get 的 `UpdatedAt`，更新后用旧值 `--updated-at` 再 update | 冲突，退出码 9；旧请求不覆盖新设置 |
 | 撤销 | cancel 后再次 files | 明确拒绝，不继续签发下载地址 |
 

@@ -8,8 +8,16 @@ pub(crate) const SHARE_SETTINGS_HELP: &str = "Create defaults to view (preview o
 
 pub(crate) const SHARE_CONNECTION_HELP: &str = "Standard IDS hosts map between idsapi/idsapp and idsapi-boe/idsapp-boe under volces.com, preserving the Instance label, scheme and port. Share pages, receiver APIs and download addresses support HTTP and HTTPS without protocol upgrades. Override custom page origins with --share-base-url and receiver API origins with --endpoint. Anonymous receivers derive APIs from page URLs without account config; explicit OAuth uses the selected profile API or --endpoint.";
 pub(crate) const SHARE_RECEIVER_HELP: &str = "inspect/files/view/download default to anonymous even if a profile configures OAuth. Explicit --auth-mode oauth reuses --profile via auth login/status and existing token refresh; it never starts login or falls back to another identity. OAuth authenticates share info/token exchange; file APIs use only x-share-token and content downloads carry no account credentials. Login and share permissions are validated by the service; passwords are still required when configured. Public URLs accept /share/<id> or /share/<id>/; one trailing slash is normalized away. Select directory prefixes with --path, not additional URL segments.";
-pub(crate) const SHARE_FILES_HELP: &str = "files returns one directory page: --limit sets its size and --marker uses the previous NextMarker; stop when IsTruncated=false. Exact file paths select one file; directory paths end in /. Each invocation needs the extraction code when configured: stdin > URL pwd > hidden ordinary-TTY prompt. --password-stdin reads to EOF (use a pipe); passwords are not saved. Download enumerates pages automatically. For files, default table/CSV uses the same file_path, size, file_type, updated_at and is_folder columns as ls, with folders first. The table Total counts displayed rows; JSON and explicit --query retain the raw service arrays.";
-pub(crate) const SHARE_DOWNLOAD_HELP: &str = "The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths still reject symlinks/reparse points. Resume compares resolved roots. Explicit service denials such as 403 retain their error code and set IssuanceOutcomeUnknown=false; ambiguous URL issuance is never automatically replayed. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Preflight can create directory scaffolding before a later transfer denial. The default download table shows a cp-style summary (total/succeeded/failed/skipped/pending), including empty results; JSON and explicit queries retain file details. Summary.Skipped counts validated completed files reused during resume and is included in Summary.Completed. Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring a checkpoint; files without either identity use one streamed GET to avoid mixing versions; --checkpoint-threshold changes the threshold and --multipart-concurrency changes the default 4 concurrent ranges. Range retries reuse the same issued URL; completed-file resume remains file-level. Scanning and file-count progress use stderr, with per-file range completion shown during large-file transfers; enabled on TTY by default; --progress forces progress, while --no-progress or --quiet disables it. --progress and --no-progress are mutually exclusive. Forbidden.ShareDownloadDisabled requires the share owner to enable --permission download.";
+// [Review Fix #ShareFilesCap1] Files expose the same result cap as ls, independent of service page sizes.
+pub(crate) const SHARE_FILES_HELP: &str = "files lists the current directory level like ls. --max-keys (default 1000) caps files and folders together; service pages are fetched automatically until the cap or listing end. Continue with --marker using the previous NextMarker; IsTruncated=false means the listing ended. --limit is not supported. Exact file paths select one file; directory paths end in /. Each invocation needs the extraction code when configured: stdin > URL pwd > hidden ordinary-TTY prompt. --password-stdin reads to EOF (use a pipe); passwords are not saved. Default table/CSV uses the same file_path, size, file_type, updated_at and is_folder columns as ls, with folders first. Folder markers, self markers and duplicates are normalized in all output modes; Total and pagination.total_returned count the same logical entries. JSON and explicit --query retain the aggregated normalized Files/Folders metadata.";
+// [Review Fix #ShareDownloadHelp1] Preserve shared selection and password guidance without advertising files-only pagination flags.
+pub(crate) const SHARE_DOWNLOAD_SELECTION_HELP: &str = "Downloads enumerate all selected service pages automatically. Exact file paths select one file; directory paths end in / and require --recursive. Password precedence is stdin > URL pwd > hidden ordinary-TTY prompt; --password-stdin reads to EOF (use a pipe), and passwords are not saved.";
+// [Review Fix #D03D04D06Docs] Local conflicts need local remedies; an ambiguous service denial cannot establish a unique cause.
+pub(crate) const SHARE_DOWNLOAD_HELP: &str = "The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths still reject symlinks/reparse points with Conflict (exit 9) and guidance to choose an ordinary local destination. Resume compares resolved roots; changed completed local file sizes or digests also fail with Conflict (exit 9). Explicit service denials such as 403 retain their error code and set IssuanceOutcomeUnknown=false; ambiguous URL issuance is never automatically replayed. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Actual downloads create directories, temporary files and, when requested, checkpoint and lock files; preflight can leave empty directories before a later transfer denial. --overwrite replaces existing ordinary files only after verification. Download URL issuance may consume download-count quota even if content transfer fails. The default download table shows a cp-style summary (total/succeeded/failed/skipped/pending), including empty results; JSON and explicit queries retain file details. Summary.Skipped counts validated completed files reused during resume and is included in Summary.Completed. Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring a checkpoint; files without either identity use one streamed GET to avoid mixing versions; --checkpoint-threshold changes the threshold and --multipart-concurrency changes the default 4 concurrent ranges. Range retries reuse the same issued URL; completed-file resume remains file-level. Scanning and file-count progress use stderr, with per-file range completion shown during large-file transfers; enabled on TTY by default; --progress forces progress, while --no-progress or --quiet disables it. --progress and --no-progress are mutually exclusive. Forbidden.ShareDownloadDisabled may mean the share permission forbids downloads or its download-count quota is exhausted; the service code alone cannot distinguish them. Ask the owner to check permission and quota; preserve the service code, HTTP status and request ID.";
+// [Review Fix #ShareReviewDocs] Keep read-only planning and explicit input validation visible in every discovery surface.
+pub(crate) const SHARE_DRY_RUN_HELP: &str = "Download --dry-run uses read-only share info/token/list/get metadata requests to enumerate every selected page and recursive folder, or validate the saved resume snapshot and completed local file digests. It returns selection.Manifest, PlanComplete=true, FileCount, DirectoryCount, TotalBytes, SkippedCount and Conflicts. Completed plans with local conflicts exit 9 and retain the plan. DownloadsIssued=0; LocalWrites=false means no local writes: no URL issuance, content fetch, directory creation, temporary file, checkpoint or lock writes. MetadataResponses counts received metadata responses; NetworkRequests=null because wire attempts are not counted. SnapshotGuaranteed=false: remote content and local paths can change after inspection. Missing or negative file sizes fail validation (exit 6); explicit zero is a valid empty file. OAuth dry-run disables automatic refresh to avoid credential and auth-lock writes. If the token is expired, within 60 seconds of expiry, or rejected with 401, first run ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth as a normal OAuth read to refresh, then retry. Planning never acquires the checkpoint lock; an existing regular sidecar may be active. Execution rechecks state and acquires its lock.";
+pub(crate) const SHARE_PASSWORD_HELP: &str = "Explicit --password-stdin must contain a nonempty password after removing one terminal LF or CRLF; EOF-only, LF-only and CRLF-only input fail validation (exit 6). Significant spaces are preserved. Omitting the flag leaves an existing password unchanged on update. create/update --dry-run also reads and validates explicit stdin; --describe and --help never read stdin.";
+pub(crate) const SHARE_OFFLINE_HELP: &str = "--describe and --help do not load config, access the network or read stdin. Share --dry-run is offline except download metadata planning. Explicit create/update --password-stdin is read and validated during dry-run.";
 pub(crate) const SHARE_SELECTOR_HELP: &str = "get/update/cancel accept adrive://instance/share-id or a bare ShareID with --instance. A repeated --instance must match the URI; --by-name resolves only the instance. Share URIs use one ShareID segment and decode components once; file/space targets are interpreted by their own command context.";
 pub(crate) const SHARE_LIST_HELP: &str = "list accepts adrive://instance (with an optional root slash) or --instance instance. A repeated --instance must match the URI; --by-name resolves the instance name. The instance URI has no share/space/file path and decodes once. List returns one page; --creator is optional only when OAuth supplies a bound user_id.";
 
@@ -24,31 +32,31 @@ pub struct ShareCommand {
 #[derive(Debug, Subcommand)]
 pub enum ShareAction {
     /// Create a share link
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SETTINGS_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SETTINGS_HELP}\n\n{SHARE_PASSWORD_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Create(CreateShareArgs),
     /// Get a share link
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SELECTOR_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SELECTOR_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Get(ShareIdArgs),
     /// List share links
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_LIST_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_LIST_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     List(ListShareArgs),
     /// Update share settings
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SELECTOR_HELP}\n\n{SHARE_SETTINGS_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_SELECTOR_HELP}\n\n{SHARE_SETTINGS_HELP}\n\n{SHARE_PASSWORD_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Update(UpdateShareArgs),
     /// Cancel a share link
-    #[command(after_help = SHARE_SELECTOR_HELP)]
+    #[command(after_help = format!("{SHARE_SELECTOR_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Cancel(CancelShareArgs),
     /// Inspect share info
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Inspect(InspectShareArgs),
     /// List shared files
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_FILES_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_FILES_HELP}\n\n{SHARE_PASSWORD_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Files(ShareFilesArgs),
     /// Preview one shared file
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_VIEW_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_VIEW_HELP}\n\n{SHARE_PASSWORD_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     View(ShareViewArgs),
     /// Download shared files
-    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_FILES_HELP}\n\n{SHARE_DOWNLOAD_HELP}"))]
+    #[command(after_help = format!("{SHARE_CONNECTION_HELP}\n\n{SHARE_RECEIVER_HELP}\n\n{SHARE_DOWNLOAD_SELECTION_HELP}\n\n{SHARE_DOWNLOAD_HELP}\n\n{SHARE_DRY_RUN_HELP}\n\n{SHARE_PASSWORD_HELP}\n\n{SHARE_OFFLINE_HELP}"))]
     Download(ShareDownloadArgs),
 }
 
@@ -245,7 +253,7 @@ pub struct InspectShareArgs {
     pub share_url: String,
 }
 
-/// Receiver file selection and one-page pagination.
+/// Receiver file selection with a combined current-level result cap.
 #[derive(Args)]
 pub struct ShareFilesArgs {
     /// Public share URL (one optional trailing slash); optional pwd query is kept secret
@@ -256,9 +264,9 @@ pub struct ShareFilesArgs {
     /// Pagination marker returned by a previous listing
     #[arg(long)]
     pub marker: Option<String>,
-    /// Maximum entries in this page
-    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-    pub limit: Option<i64>,
+    /// Maximum entries to return from the current directory level
+    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(i32).range(1..))]
+    pub max_keys: i32,
     /// Read the receiver password from stdin; it does not change the share password (EOF; use a pipe or Enter then Ctrl-D on macOS/Linux)
     #[arg(long = "password-stdin")]
     pub is_password_stdin: bool,
@@ -368,5 +376,31 @@ impl std::fmt::Debug for ShareDownloadArgs {
             .debug_struct("ShareDownloadArgs")
             .field("share_url", &safe_url)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod files_pagination_tests {
+    use super::*;
+
+    #[test]
+    fn files_accepts_max_keys_and_rejects_removed_limit() {
+        let command = ShareFilesArgs::augment_args(clap::Command::new("files"));
+        let parsed = command.clone().try_get_matches_from([
+            "files",
+            "https://example.test/share/s",
+            "--max-keys",
+            "4",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "--max-keys must select the result cap: {parsed:?}"
+        );
+        assert!(
+            command
+                .try_get_matches_from(["files", "https://example.test/share/s", "--limit", "4",])
+                .is_err(),
+            "removed --limit must not remain an alias"
+        );
     }
 }

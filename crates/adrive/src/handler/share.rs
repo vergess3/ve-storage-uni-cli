@@ -17,7 +17,8 @@ use tos_core::agent::{envelope::Envelope, error::CliError, global_args::GlobalAr
 use tos_core::infra::config::ConfigFile;
 
 /// Execute one share action with normal Envelope, query and request-trace behavior.
-/// Describe/dry-run perform no password/config/authentication I/O; receivers use OAuth only when explicitly selected.
+/// Describe performs no input I/O; download dry-run reads metadata and other plans validate explicit password stdin.
+/// Receivers use OAuth only when explicitly selected.
 pub async fn handle_share_command(
     global: &GlobalArgs,
     auth: &ADriveAuthArgs,
@@ -49,6 +50,10 @@ pub async fn handle_share_command(
     }
     validate_action(action)?;
     if global.dry_run {
+        if let ShareAction::Download(args) = action {
+            return super::share_download_plan::dry_run(global, auth, args).await;
+        }
+        validate_dry_run_password(action).await?;
         output_result(global, &Envelope::success(&command, share_plan(action)?))?;
         return Ok(0);
     }
@@ -63,6 +68,19 @@ pub async fn handle_share_command(
         return super::share_download::download(global, auth, args).await;
     }
     execute_with_interrupt(global, auth, action).await
+}
+
+async fn validate_dry_run_password(action: &ShareAction) -> Result<(), CliError> {
+    let is_password_stdin = match action {
+        ShareAction::Create(args) => args.settings.is_password_stdin,
+        ShareAction::Update(args) => args.settings.is_password_stdin,
+        _ => false,
+    };
+    if is_password_stdin {
+        // [Review Fix #D05] Validate the explicitly selected secret without exposing it in the dry-run plan.
+        super::share_password::read_password_stdin().await?;
+    }
+    Ok(())
 }
 
 async fn execute_with_interrupt(
@@ -159,6 +177,7 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
             .map(|_| ())
             .map_err(map_ids_error),
         ShareAction::Files(args) => {
+            super::share_listing::validate_arguments(args)?;
             parse_share_url(&args.share_url).map_err(map_ids_error)?;
             validate_selection(args.path.as_deref())
         }
@@ -175,6 +194,9 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
         ShareAction::Download(args) => {
             parse_share_url(&args.share_url).map_err(map_ids_error)?;
             validate_selection(args.path.as_deref())?;
+            if let Some(path) = &args.path {
+                super::share_manifest::validate_relative(path.strip_suffix('/').unwrap_or(path))?;
+            }
             super::share_content::ContentRuntime::for_args(args)?;
             require_text(&args.destination_dir, "destination directory")
         }
@@ -833,13 +855,16 @@ fn share_plan(action: &ShareAction) -> Result<Value, CliError> {
             json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url})
         }
         ShareAction::Files(args) => {
-            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path})
+            // [Review Fix #ShareFilesPlan1] Offline plans must show and validate the same cap/cursor as execution.
+            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"MaxKeys":args.max_keys,"Marker":args.marker})
         }
         ShareAction::View(args) => {
             json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"Raw":args.is_raw,"NetworkRequests":0,"ConsumesPreviewLimit":true})
         }
-        ShareAction::Download(args) => {
-            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"DestinationDir":args.destination_dir,"Checkpoint":args.checkpoint,"Resume":args.is_resume,"Recursive":args.is_recursive,"Overwrite":args.is_overwrite,"PlanComplete":false,"Manifest":null,"FileCount":null,"NetworkRequests":0})
+        ShareAction::Download(_) => {
+            return Err(validation(
+                "download planning requires the read-only metadata planner",
+            ))
         }
     };
     Ok(
@@ -879,6 +904,29 @@ mod tests {
     }
     fn action(arguments: &[&str]) -> ShareAction {
         TestCli::parse_from(std::iter::once("test").chain(arguments.iter().copied())).action
+    }
+
+    #[test]
+    fn files_plan_exposes_max_keys_and_marker_with_local_validation() {
+        let selected = action(&[
+            "files",
+            "https://pages.test/share/s",
+            "--max-keys",
+            "3",
+            "--marker",
+            "next",
+        ]);
+        validate_action(&selected).unwrap();
+        let plan = share_plan(&selected).unwrap();
+        assert_eq!(plan["selection"]["MaxKeys"], 3);
+        assert_eq!(plan["selection"]["Marker"], "next");
+        let invalid = action(&[
+            "files",
+            "https://pages.test/share/s",
+            "--marker",
+            "bad\nmarker",
+        ]);
+        assert!(validate_action(&invalid).is_err());
     }
 
     #[test]

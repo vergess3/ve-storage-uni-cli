@@ -131,21 +131,21 @@ impl Checkpoint {
     }
     /// Read bounded strict JSON and validate it against the requested task identity; return the original journal or an error.
     pub(crate) fn load(&self, identity: &Identity) -> Result<Journal, CliError> {
-        let mut bytes = Vec::new();
-        self.directory
-            .read(&self.name)?
-            .take((MAX_MANIFEST_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(invalid("checkpoint exceeds 8 MiB"));
-        }
-        let mut journal: Journal = serde_json::from_slice(&bytes)
-            .map_err(|_| invalid("invalid checkpoint JSON/schema"))?;
-        journal.validate(identity)?;
-        // [Review Fix #ShareReceiveResume1] Persist the explicit API identity after successful legacy validation.
-        journal.identity = identity.clone();
-        Ok(journal)
+        read_journal(&self.directory, &self.name, identity)
     }
+    /// Read and validate a saved journal without creating a directory/lock or modifying the checkpoint.
+    pub(super) fn read_only(path: &Path, identity: &Identity) -> Result<Journal, CliError> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("invalid checkpoint filename"))?;
+        super::share_manifest::validate_relative(name)?;
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let resolved = resolve_directory(parent, false)?;
+        let directory = SafeDir::open_resolved(&resolved)?;
+        read_journal(&directory, name, identity)
+    }
+
     /// Atomically persist the validated secret-free journal with file synchronization; reject initial replacement and propagate failures.
     pub(crate) fn save(&self, journal: &Journal) -> Result<(), CliError> {
         journal.validate(&journal.identity)?;
@@ -161,6 +161,22 @@ impl Checkpoint {
         Ok(())
     }
 }
+fn read_journal(directory: &SafeDir, name: &str, identity: &Identity) -> Result<Journal, CliError> {
+    let mut bytes = Vec::new();
+    directory
+        .read(name)?
+        .take((MAX_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid("checkpoint exceeds 8 MiB"));
+    }
+    let mut journal: Journal =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid checkpoint JSON/schema"))?;
+    journal.validate(identity)?;
+    journal.identity = identity.clone();
+    Ok(journal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

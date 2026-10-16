@@ -61,6 +61,7 @@ pub struct OAuthTokenManager {
     profile_name: String,
     client_options: ClientOptions,
     source: CredentialSource,
+    is_refresh_allowed: bool,
 }
 
 impl OAuthTokenManager {
@@ -106,7 +107,15 @@ impl OAuthTokenManager {
             profile_name,
             client_options,
             source,
+            is_refresh_allowed: true,
         })
+    }
+
+    /// Disable refresh and its credential/coordination writes for a read-only plan.
+    /// Existing usable credentials still work; refresh-dependent requests return an authentication error.
+    pub(crate) fn without_refresh(mut self) -> Self {
+        self.is_refresh_allowed = false;
+        self
     }
 
     /// Return a usable Access Token, refreshing file credentials when needed.
@@ -143,6 +152,7 @@ impl OAuthTokenManager {
                 if let Some(snapshot) = oauth_credential_snapshot(&stored, apply_refresh_window)? {
                     return Ok(snapshot);
                 }
+                self.validate_refresh_allowed()?;
                 let _guard =
                     RefreshLockGuard::acquire(&self.credentials_path, &self.profile_name).await?;
                 let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
@@ -266,6 +276,7 @@ impl OAuthTokenManager {
     }
 
     async fn refresh_file(&self, rejected_access_token: Option<&str>) -> Result<String, CliError> {
+        self.validate_refresh_allowed()?;
         let _guard = RefreshLockGuard::acquire(&self.credentials_path, &self.profile_name).await?;
         let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
         if let Some(rejected) = rejected_access_token {
@@ -278,6 +289,14 @@ impl OAuthTokenManager {
             return Ok(access_token);
         }
         self.refresh_locked(stored).await
+    }
+
+    fn validate_refresh_allowed(&self) -> Result<(), CliError> {
+        if !self.is_refresh_allowed {
+            // [Review Fix #D02] Rotating/persisting tokens or creating an OAuth lock would violate a read-only download plan.
+            return Err(CliError::AuthFailed("[oauth_refresh_required] read-only dry-run requires a usable OAuth Access Token; allow refresh with a normal share inspect <share-url> --auth-mode oauth using the selected profile, then retry".into()));
+        }
+        Ok(())
     }
 
     async fn refresh_locked(&self, stored: StoredOAuthCredentials) -> Result<String, CliError> {

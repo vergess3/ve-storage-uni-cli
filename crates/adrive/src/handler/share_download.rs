@@ -5,7 +5,7 @@ use super::{
     share_content::{local_digest, ContentClient},
     share_download_progress::DownloadProgress,
     share_local::{resolve_directory, SafeDir},
-    share_manifest::{enumerate, RemoteFile},
+    share_manifest::{enumerate, Entry, RemoteFile},
     share_receive::ShareReceiver,
 };
 use crate::cli::share::ShareDownloadArgs;
@@ -185,7 +185,7 @@ async fn load_or_enumerate(
         })
     }
 }
-fn task_identity(
+pub(super) fn task_identity(
     receiver: &ShareReceiver,
     args: &ShareDownloadArgs,
     destination: &Path,
@@ -204,7 +204,7 @@ fn task_identity(
 fn invalid(message: &str) -> CliError {
     CliError::ValidationError(message.into())
 }
-fn check_reserved(journal: &Journal, checkpoint: Option<&Path>) -> Result<(), CliError> {
+pub(super) fn check_reserved(journal: &Journal, checkpoint: Option<&Path>) -> Result<(), CliError> {
     let destination = Path::new(&journal.identity.destination);
     for relative in journal
         .manifest
@@ -278,31 +278,68 @@ async fn validate_resume(
         .ok_or_else(|| invalid("missing manifest"))?;
     for (index, entry) in journal.manifest.files.iter().enumerate() {
         progress.active = Some(index);
-        if !entry.remote.has_identity() {
-            return Err(invalid(
-                "resume requires a strong ETag or CRC64 remote identity",
-            ));
-        }
-        let current = receiver
-            .ensure_session()
-            .await?
-            .get_file(&entry.remote.path)
-            .await
-            .map_err(map_ids_error)?;
-        if RemoteFile::from_info(current)? != entry.remote {
-            return Err(invalid("remote file changed since checkpoint"));
-        }
-        if let Some(expected) = &journal.completed[index] {
-            let (size, digest) = local_digest(directory, &entry.local, entry.remote.size).await?;
-            if size != entry.remote.size || &digest != expected {
-                return Err(invalid("completed local file changed since checkpoint"));
-            }
+        if verify_resume_entry(
+            receiver,
+            Some(directory),
+            entry,
+            journal.completed[index].as_deref(),
+        )
+        .await?
+        {
             progress.skipped += 1;
         }
         progress.verified[index] = true;
         progress.active = None;
     }
     Ok(())
+}
+
+/// Verify remote identity and any completed local digest without modifying a checkpoint.
+/// `directory` may be absent for pending entries; `expected` is the completed SHA256, if any.
+/// Returns whether the entry is completed; mismatched/missing completed bytes are conflicts, while native I/O errors propagate.
+pub(super) async fn verify_resume_entry(
+    receiver: &mut ShareReceiver,
+    directory: Option<&SafeDir>,
+    entry: &Entry,
+    expected: Option<&str>,
+) -> Result<bool, CliError> {
+    if !entry.remote.has_identity() {
+        return Err(invalid(
+            "resume requires a strong ETag or CRC64 remote identity",
+        ));
+    }
+    let current = receiver
+        .ensure_session()
+        .await?
+        .get_file(&entry.remote.path)
+        .await
+        .map_err(map_ids_error)?;
+    // [Review Fix #D03] Checkpoint identity/content changes use the cp-compatible conflict category.
+    if RemoteFile::from_info(current)? != entry.remote {
+        return Err(CliError::Conflict(
+            "remote file changed since checkpoint".into(),
+        ));
+    }
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    let directory = directory.ok_or_else(|| {
+        CliError::Conflict("completed local file missing since checkpoint".into())
+    })?;
+    let (size, digest) = local_digest(directory, &entry.local, entry.remote.size)
+        .await
+        .map_err(|error| match error {
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                CliError::Conflict("completed local file missing since checkpoint".into())
+            }
+            error => error,
+        })?;
+    if size != entry.remote.size || digest != expected {
+        return Err(CliError::Conflict(
+            "completed local file changed since checkpoint".into(),
+        ));
+    }
+    Ok(true)
 }
 fn save_progress(progress: &mut Progress) -> Result<(), CliError> {
     if let (Some(checkpoint), Some(journal)) = (&progress.checkpoint, &progress.journal) {
@@ -470,18 +507,32 @@ fn failed_aggregate(
     });
     if let Some(detail) = &mut envelope.error {
         apply_download_denial_guidance(detail);
+        apply_local_conflict_guidance(detail);
     }
     (envelope, code)
+}
+
+fn apply_local_conflict_guidance(detail: &mut ErrorDetail) {
+    if matches!(detail.kind, ErrorKind::Conflict)
+        && detail.message.contains("[share_local_path_conflict]")
+    {
+        // [Review Fix #D04] A refused local entry needs filesystem repair, not account or remote permission changes.
+        detail.suggested_action = Some("Inspect the local destination; replace the unsafe entry with an ordinary file/directory as appropriate, or choose another directory".into());
+        detail.fix_command = None;
+        detail.doctor_hint = None;
+    }
 }
 
 fn apply_download_denial_guidance(detail: &mut ErrorDetail) {
     if detail.code == "Forbidden.ShareDownloadDisabled"
         && matches!(detail.kind, ErrorKind::PermissionDenied)
     {
-        // [Review Fix #ShareDownloadDisplay3] Early token denials retain the permission classification even when the shared error mapper omits the HTTP status.
         // [Review Fix #ShareDownloadDisplay2] A known share policy denial is not repaired by refreshing account or IAM credentials.
-        detail.message = "Share download is disabled by the share permission".into();
-        detail.suggested_action = Some("Ask the share owner to enable --permission download; retry only after the share policy allows downloads".into());
+        // [Review Fix #D06] This service code can indicate permission or exhausted download count; avoid claiming one cause.
+        detail.message =
+            "Share download is blocked; share permission or download-count quota may prevent it"
+                .into();
+        detail.suggested_action = Some("Ask the share owner to check download permission (--permission download) and download-count quota; retry after resolving the restriction".into());
     }
 }
 

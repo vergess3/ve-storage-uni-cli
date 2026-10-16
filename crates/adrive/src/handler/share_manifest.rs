@@ -203,8 +203,9 @@ impl RemoteFile {
     /// Extract the minimal remote fingerprint from metadata, rejecting unsafe paths or invalid sizes.
     pub(crate) fn from_info(info: FileInfo) -> Result<Self, CliError> {
         validate_relative(&info.file_path)?;
-        let size =
-            u64::try_from(info.size).map_err(|_| invalid("remote file has negative size"))?;
+        let size = u64::try_from(info.size).map_err(|_| {
+            invalid("remote file size is missing or negative; cannot build an exact download plan")
+        })?;
         if info.etag.len() > 1024 || info.etag.chars().any(char::is_control) {
             return Err(invalid("invalid remote ETag"));
         }

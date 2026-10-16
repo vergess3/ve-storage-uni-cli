@@ -230,7 +230,7 @@ fn receiver_help_and_describe_explain_optional_url_slash_and_directory_selection
 }
 
 #[test]
-fn share_files_describe_and_help_explain_ls_table_columns_without_changing_json() {
+fn share_files_describe_and_help_explain_ls_columns_and_structured_metadata() {
     let help = TestCli::try_parse_from(["test", "share", "files", "--help"])
         .err()
         .unwrap()
@@ -253,6 +253,49 @@ fn share_files_describe_and_help_explain_ls_table_columns_without_changing_json(
 }
 
 #[test]
+fn share_files_help_and_localized_describe_explain_combined_result_cap() {
+    let help = TestCli::try_parse_from(["test", "share", "files", "--help"])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(help.contains("--max-keys") && help.contains("default 1000"));
+    assert!(help.contains("files and folders together"));
+    assert!(help.contains("service pages are fetched automatically"));
+    let mut described =
+        ve_adrive_cli::share_metadata::describe_share_command("ve-adrive share files").unwrap();
+    ve_adrive_cli::handler::meta::localize_adrive_auth_documentation_zh(&mut described);
+    let semantics = described["semantics"].to_string();
+    for phrase in [
+        "--max-keys",
+        "默认 1000",
+        "合计条目数",
+        "自动获取服务分页",
+        "聚合且规范化",
+    ] {
+        assert!(
+            semantics.contains(phrase),
+            "missing localized guidance: {phrase}"
+        );
+    }
+    assert!(!semantics.contains("原始数组"));
+}
+
+#[test]
+fn share_download_help_does_not_advertise_listing_pagination_flags() {
+    let help = TestCli::try_parse_from(["test", "share", "download", "--help"])
+        .err()
+        .unwrap()
+        .to_string();
+    for flag in ["--max-keys", "--marker", "--limit"] {
+        assert!(!help.contains(flag), "download help advertises {flag}");
+    }
+    assert!(help.contains("EOF"));
+    assert!(help.contains("default to anonymous"));
+    assert!(help.contains("Password precedence is stdin > URL pwd"));
+    assert!(help.contains("Downloads enumerate all selected service pages automatically"));
+}
+
+#[test]
 fn share_download_describe_explains_root_selection_denial_and_summary() {
     let mut described =
         ve_adrive_cli::share_metadata::describe_share_command("ve-adrive share download").unwrap();
@@ -266,6 +309,12 @@ fn share_download_describe_explains_root_selection_denial_and_summary() {
         .to_string()
         .contains("单文件自动选中"));
     assert!(described["semantics"].to_string().contains("按文件计数"));
+    assert!(described["semantics"]
+        .to_string()
+        .contains("下载自动枚举全部选中服务分页"));
+    assert!(described["semantics"]
+        .to_string()
+        .contains("密码优先级为 stdin > URL pwd"));
 }
 
 #[test]

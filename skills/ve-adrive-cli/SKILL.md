@@ -400,7 +400,10 @@ and limit is positive. Each invocation returns one page, preserving
 Update changes only supplied settings, forwarding zero, false and empty strings.
 It fetches `UpdatedAt` unless `--updated-at` is explicit. The shared target cannot
 change. Cancel uses global `--yes` in JSON, quiet or noninteractive execution;
-ordinary TTY execution asks once. Dry-run never confirms or reads password stdin.
+ordinary TTY execution asks once. Dry-run never confirms. Explicit create/update
+`--password-stdin` is read and validated even during dry-run; omitting the flag
+preserves the existing password on update. `--describe` and `--help` load no config,
+access no network and read no stdin.
 Cancellation uses API selectors and does not resolve a share-page origin. Ctrl-C
 restores terminal echo; an interruption after mutation submission requires
 reconciliation with get/list before retrying.
@@ -409,8 +412,9 @@ Use `--password-stdin` with a pipe; it reads to EOF and keeps a password out of 
 For manual macOS/Linux stdin, press Enter then Ctrl-D within 30 seconds. Enter alone
 does not close stdin. Files/download can instead use the ordinary hidden terminal
 prompt without this flag and finish with Enter. One terminal LF/CRLF is
-removed and significant spaces are preserved. The PRD does not confirm password
-clearing; do not treat empty input as a documented clearing contract.
+removed and significant spaces are preserved. Explicit EOF-only, LF-only or
+CRLF-only input fails validation (exit 6) before mutation or share-token exchange.
+The PRD does not confirm password clearing; empty input never clears a password.
 Passwords are bounded to 4096 UTF-8 bytes and reject controls
 or multiple lines. MCP's virtual `password` is write-only and piped to child stdin;
 explicit password takes precedence over a URL `pwd` query. Do not place passwords
@@ -425,34 +429,47 @@ paths. Use `--output json` for structured data. To recover a previous creation's
 ID/URL, use read-only `share list`/`share get`; do not repeat `share create` merely
 to select another output format.
 
-`share inspect` reads public info without share-token/password I/O; explicit OAuth
-can load/refresh the selected account token. `share files`
+`share inspect` reads the public share overview without share-token/password I/O;
+use `share files` for file metadata. Explicit OAuth can load/refresh the selected
+account token. `share files`
 uses exact metadata for a file `--path` and directory listing for a trailing `/`;
-no path lists share roots, including a single-file share. Preserve returned paths
-exactly. Listing returns one page with `NextMarker` and `IsTruncated`; pass
-`--marker` for another page and `--limit` for its size (service default/max 100;
-CLI accepts positive limits). Default table/CSV uses the same `file_path`, `size`,
-`file_type`, `updated_at`, `is_folder` columns and folder-first rows as `ls`, with
-stable headers even on empty pages. Table Total counts normalized display rows;
-JSON and explicit `--query` preserve the raw service arrays. Download enumerates
-pages automatically. Each
-independent call/page needs the extraction code again; passwords are never saved.
+no path lists share roots, including a single-file share. Reuse paths exactly as
+returned by the CLI. Like `ls`, listing uses `--max-keys` (default 1000) as the
+combined cap for files and folders at the current directory level. It automatically fetches
+service pages until the cap or listing end, including short internal pages.
+Pass the returned `NextMarker` unchanged through `--marker` in a later invocation
+to continue; stop when `IsTruncated=false`. `--max-keys` accepts integers from 1
+through 2147483647. `share files` has no `--limit` alias; management `share list`
+retains its existing `--limit`/`--offset` pagination. Default table/CSV uses the same
+`file_path`, `size`, `file_type`, `updated_at`, `is_folder` columns and folder-first rows as `ls`, with
+stable headers even on empty results. JSON and explicit `--query` preserve the
+`Files`, `Folders`, `NextMarker` and `IsTruncated` field names with aggregated,
+normalized current-level metadata. Directory marker entries, self entries and
+duplicates are normalized before output in all formats; Total and
+pagination.total_returned count the same logical entries. Download enumerates
+pages automatically and accepts no
+`--max-keys`, `--marker` or `--limit` flags. Each independent invocation needs the
+extraction code again; passwords are never saved.
 OAuth does not bypass password checks. Receiver password precedence is stdin > URL `pwd` >
 a hidden ordinary-TTY prompt; JSON/noninteractive execution requires stdin or URL.
 No alternate password is retried after an explicit failure.
 
 `share download <url> <destination-dir>` uses a directory destination, with
 no `--path` selecting all share roots. A single-file share automatically selects
-its file; folders require `--recursive`. Preflight may create directory scaffolding
-before a later transfer denial, leaving empty folders. Default table output shows
+its file; folders require `--recursive`. Actual downloads create directories,
+temporary files and, when requested, checkpoint and lock files; `--overwrite` replaces
+existing ordinary files only after verification. Preflight may create directory
+scaffolding before a later transfer denial, leaving empty folders. Issuing download
+URLs may consume download-count quota even if content transfer later fails. Default table output shows
 the same summary style as cp (total/succeeded/failed/skipped/pending), including
 empty results. JSON and explicit queries retain file details. Summary.Completed
 includes Summary.Skipped; the table's succeeded count excludes resumed files.
 Scanning/file-count progress uses stderr, defaults to TTY, can be forced by
 --progress, and is disabled by --no-progress or --quiet. The progress flags are
 mutually exclusive. Forced non-TTY progress uses plain lines.
-`Forbidden.ShareDownloadDisabled` is a share policy error: the share
-owner must enable `--permission download`.
+`Forbidden.ShareDownloadDisabled` may mean share permission forbids downloads or
+download-count quota is exhausted; the code alone cannot distinguish them. Ask the
+owner to check permission and quota; retain service code, HTTP status and request ID.
 Supported options are `--path`, `--recursive`, `--overwrite`, `--progress`,
 `--no-progress`, `--checkpoint-threshold <size>`, `--multipart-concurrency <n>`,
 `--checkpoint <file>`, and
@@ -484,21 +501,46 @@ Share download safety/recovery contract: enumerate at most 20,000 entries / 10,0
 pages / 64 path components / 8 MiB before issuing any signed URL. Preserve the
 selected directory basename once and empty directories. The OS resolves user-selected
 destination/checkpoint directory aliases before the CLI pins their actual roots;
-macOS `/tmp` and `/var` work without special-case rules. Native permission/type/disk
-errors are retained. Downloaded subpaths reject traversal,
+macOS `/tmp` and `/var` work without special-case rules. Intentional symlink/reparse
+descendant rejection returns Conflict (exit 9) with guidance to inspect the local
+path or choose another destination; unrelated native permission/disk/I/O errors are
+retained. Downloaded subpaths reject traversal,
 symlinks/reparse points, case/Unicode and ancestor collisions; `--overwrite`
 accepts only ordinary files. Transfer with an independent credential-free HTTP(S)
 client, no redirects, size/CRC64/strong ETag checks and local SHA-256. A signed URL
 is issued once per attempted file; bounded content retries reuse that address.
 `--resume` requires the same share origin/ID, selection, resolved destination and overwrite/
 recursive policy, rechecks remote fingerprints and completed local hashes, and
-never adds new files or resumes partial byte ranges. A checkpoint with no strong
+never adds new files or resumes partial byte ranges. Completed local size/hash
+mismatches return Conflict (exit 9), consistent with `cp`, preserving local files
+and the checkpoint. A checkpoint with no strong
 remote identity is refused. The checkpoint and lock cannot overlap mapped destinations,
 even through local directory aliases. Explicit service rejection retains its service
 code/status/category/request ID when available; download-disabled 403 exits 5 with
 permission-denied kind and `IssuanceOutcomeUnknown=false`. Do not blindly retry unknown URL issuance: quota may
 already have been consumed. The aggregate has `Complete`, `PlanComplete`,
 `CheckpointAvailable`, `IssuanceOutcomeUnknown`, `Summary` and per-file states.
+
+`share download --dry-run` uses read-only share info/token/list/get metadata and
+enumerates every selected page and recursive folder. It returns `selection.Manifest`
+with roots and remote-to-local mappings plus `PlanComplete=true`, `FileCount`,
+`DirectoryCount`, `TotalBytes`, `SkippedCount` and `Conflicts`. Missing or negative
+file sizes fail validation (exit 6); explicit zero is a valid empty file. A completed plan
+with local conflicts exits 9 and retains the plan. Resume planning reads the saved
+checkpoint and validates identities, remote metadata and completed local digests
+without locks or saves. It never issues download URLs, fetches content, creates
+directories/temporary files or writes checkpoint/lock files: `DownloadsIssued=0`,
+`LocalWrites=false`. `MetadataResponses` counts received metadata responses;
+`NetworkRequests=null` because wire attempts are not counted.
+`SnapshotGuaranteed=false` means content and local paths can change after inspection.
+OAuth dry-run disables automatic refresh to avoid credential/auth-lock writes.
+For an expired token, a token within 60 seconds of expiry, or a 401 response, first run
+`ve-adrive-cli --profile <profile> share inspect <share-url> --auth-mode oauth`
+as a normal OAuth read to refresh, then retry. Planning never acquires the
+checkpoint lock; an existing regular sidecar may be active. Execution rechecks and locks.
+Other share dry-runs remain offline, with explicit create/update password stdin
+validation as above. Describe exposes `dry_run_output_schema` separately from
+the unchanged execution `output_schema`.
 
 Shared files at least 20MB with a strong ETag or CRC64 automatically use concurrent
 16MiB Range requests; files without either use one streamed GET to avoid mixing versions.

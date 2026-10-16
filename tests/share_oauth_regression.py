@@ -140,7 +140,7 @@ def check_modes(binary, prefix, root, url, endpoint):
 
 
 def check_pages(binary, prefix, root, url):
-    arguments = ["share", "files", url, "--auth-mode", "oauth", "--password-stdin", "--path", "docs/", "--limit", "1"]
+    arguments = ["share", "files", url, "--auth-mode", "oauth", "--password-stdin", "--path", "docs/", "--max-keys", "1"]
     for marker in (None, "second-page"):
         result, envelope = invoke(binary, prefix, root, arguments + (["--marker", marker] if marker else []), "fixture-password\n")
         assert result.returncode == 0
@@ -173,6 +173,27 @@ def check_download(binary, prefix, root, url):
     result, envelope = invoke(binary, prefix, root, arguments + ["--resume", "--profile", "other"], "fixture-password\n")
     assert result.returncode != 0 and not envelope["success"]
     assert signed_count() == before + 1
+
+
+def check_read_only_plan(binary, prefix, root, url):
+    arguments = ["share", "download", url, str(root / "planned-out"), "--auth-mode", "oauth",
+                 "--password-stdin", "--path", "a.txt", "--dry-run"]
+    saved = (root / "credentials").read_bytes()
+    entries = set(root.iterdir())
+    before = signed_count()
+    result, envelope = invoke(binary, prefix, root, arguments, "fixture-password\n")
+    assert result.returncode == 0 and envelope["data"]["selection"]["FileCount"] == 1, envelope
+    assert signed_count() == before and set(root.iterdir()) == entries
+    assert (root / "credentials").read_bytes() == saved
+    expired = saved.decode().replace("expires_at='", "expires_at='2000-01-01T00:00:00Z' # ")
+    (root / "credentials").write_text(expired)
+    start = len(Receipt.requests)
+    try:
+        result, envelope = invoke(binary, prefix, root, arguments, "fixture-password\n")
+        assert result.returncode != 0 and len(Receipt.requests) == start, envelope
+        assert (root / "credentials").read_text() == expired and set(root.iterdir()) == entries
+    finally:
+        (root / "credentials").write_bytes(saved)
 
 
 def check_refresh(binary, prefix, root, url):
@@ -261,7 +282,9 @@ def check_no_io(binary, prefix, root, url):
     start = len(Receipt.requests)
     for action in ("inspect", "files", "download"):
         arguments = ["share", action, url] + ([str(root / "dry-out")] if action == "download" else [])
-        for flag in ("--dry-run", "--describe"):
+        # [Review Fix #D02] Download planning now resolves the explicitly selected OAuth profile and performs metadata I/O.
+        flags = ("--describe",) if action == "download" else ("--dry-run", "--describe")
+        for flag in flags:
             result, _envelope = invoke(binary, prefix, root, arguments + ["--auth-mode", "oauth", flag])
             assert result.returncode == 0 and len(Receipt.requests) == start
     assert not (root / "dry-out").exists()
@@ -292,6 +315,7 @@ def check_binary(binary, prefix, endpoint, auth_endpoint):
         check_modes(binary, prefix, root, url, endpoint)
         check_pages(binary, prefix, root, url)
         check_download(binary, prefix, root, url)
+        check_read_only_plan(binary, prefix, root, url)
         check_applied_subject(binary, prefix, root, url)
         check_instance_snapshot(binary,prefix,root)
         check_refresh(binary, prefix, root, url)

@@ -4,6 +4,7 @@ Run: python3 tests/share_download_regression.py [unified-binary] [standalone-bin
 """
 import http.server
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -21,14 +22,17 @@ class Receiver(http.server.BaseHTTPRequestHandler):
     is_valid_content = False
     issued_address = None
     token_status = 200
+    token_request_id = None
 
     def log_message(self, *_arguments):
         pass
 
-    def respond(self, payload, status=200):
+    def respond(self, payload, status=200, request_id=None):
         encoded = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Length", str(len(encoded)))
+        if request_id is not None:
+            self.send_header("x-ids-request-id", request_id)
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -36,7 +40,7 @@ class Receiver(http.server.BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.requests.append(self.path)
         if self.token_status == 403:
-            self.respond({"Code": "Forbidden.ShareDownloadDisabled"}, 403)
+            self.respond({"Code": "Forbidden.ShareDownloadDisabled"}, 403, self.token_request_id)
         else:
             self.respond({"AccessToken": "fixture-token", "ExpiresIn": 60})
 
@@ -92,7 +96,11 @@ def check_binary(binary, prefix, server):
         before = len(Receiver.requests)
         dry = subprocess.run([*common, "--dry-run"], capture_output=True, timeout=10)
         assert dry.returncode == 0 and json.loads(dry.stdout)["success"]
-        assert len(Receiver.requests) == before
+        selection = json.loads(dry.stdout)["data"]["selection"]
+        assert selection["PlanComplete"] and selection["FileCount"] == 1 and selection["TotalBytes"] == 3
+        # [Review Fix #D02] Planning now queries metadata, while URL issuance and content remain execution-only.
+        assert len(Receiver.requests) > before
+        assert not any("download_url" in path or path == "/content" for path in Receiver.requests[before:])
         assert not (root / "out").exists() and not (root / "journal").exists()
         failed = subprocess.run(common, capture_output=True, timeout=10)
         assert failed.returncode != 0
@@ -180,6 +188,37 @@ def check_known_denial(binary, prefix, server):
             Receiver.issuance_status = 200
 
 
+def check_early_token_denial(binary, prefix, server):
+    with tempfile.TemporaryDirectory(prefix="share-token-denial-") as folder:
+        root = Path(folder)
+        environment = os.environ.copy()
+        environment["TOS_LAST_REQUEST_ID"] = "synthetic-stale-request"
+        Receiver.token_status = 403
+        try:
+            for request_id in ("token-denial-request", None):
+                Receiver.token_request_id = request_id
+                before = len(Receiver.requests)
+                result = subprocess.run([str(binary), *prefix, "share", "download",
+                    f"http://127.0.0.1:{server.server_port}/share/s", str(root / "out"),
+                    "--path", "a", "--output", "json",
+                    "--config-path", str(root / "missing-config"),
+                    "--credentials-path", str(root / "missing-credentials")],
+                    env=environment, capture_output=True, timeout=10)
+                envelope = json.loads(result.stdout)
+                assert result.returncode == 5 and envelope["status_code"] == 403, envelope
+                assert envelope["ec"] == "Forbidden.ShareDownloadDisabled"
+                assert envelope["request_id"] == request_id, envelope
+                assert envelope["status_code"] == 403
+                assert envelope["error"]["kind"] == "permission_denied"
+                assert "quota" in envelope["error"]["suggested_action"]
+                assert envelope["data"]["IssuanceOutcomeUnknown"] is False
+                assert len(Receiver.requests) == before + 2
+                assert not (root / "out").exists()
+        finally:
+            Receiver.token_status = 200
+            Receiver.token_request_id = None
+
+
 def check_denial_tabular_output(binary, prefix, server):
     with tempfile.TemporaryDirectory(prefix="share-view-display-") as folder:
         root = Path(folder)
@@ -194,7 +233,7 @@ def check_denial_tabular_output(binary, prefix, server):
                 result = subprocess.run([*arguments, "--output", output], capture_output=True, text=True, timeout=10)
                 assert result.returncode == 5
                 assert "Forbidden.ShareDownloadDisabled" in result.stdout, "tabular output hid the failure"
-                assert "Share download is disabled" in result.stdout
+                assert "Share download is blocked" in result.stdout and "quota" in result.stdout
                 expected = ("data.summary", "data.complete") if output == "table" else ("data.Summary", "data.Complete")
                 assert all(field in result.stdout for field in expected)
                 assert not (root / "out/a").exists()
@@ -265,6 +304,7 @@ def main():
             check_interrupt(binary, prefix, server)
             check_selector_tamper(binary, prefix, server)
             check_known_denial(binary, prefix, server)
+            check_early_token_denial(binary, prefix, server)
             check_denial_tabular_output(binary, prefix, server)
             check_root_alias_resume(binary, prefix, server)
             check_unusable_address(binary, prefix, server)
