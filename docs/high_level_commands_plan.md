@@ -158,7 +158,8 @@ Execute 阶段的批量任务默认并发 `16`。`sync --delete`、`rm --recursi
 - `operation`：`cp` 按传输方向记录 `upload`、`download`、`copy` 或 `local-copy`；其他批量命令记录各自的动作类型。
 - `source` / `destination`：原始用户路径，敏感信息不得写入。
 - `bucket` / `key`：规范化 TOS 目标。
-- `bytes`、`etag`、`version_id`、`request_id`：成功项可观测字段。
+- `bytes`、`etag`、`version_id`：成功项可观测字段。
+- `request_id`：成功、失败项有自身服务响应 ID 均记录，没有则留空；逐行报告不受命令级 `service_request_ids` 前 100 个上限影响。
 - `error_kind`、`error_code`、`message`：失败项确定性错误字段。
 - `retryable`：标记是否可直接重试。
 
@@ -312,3 +313,9 @@ TOS -> TOS 复制优先使用 `CopyObject`。如果服务端限制单次 Copy �
 - `Agent Ecosystem`：新增 `tests/high_level_principles_test.rs`，覆盖 discover、understand、safe execute、controlled output、deterministic error。
 - `Batch Report`：批量命令必须测试部分成功/部分失败输出中同时包含 `succeeded` 和 `failed` 清单。
 - `Large File`：`cp` 必须测试 strategy 选择、checkpoint 读写、跳过已完成 part、complete 后清理 checkpoint。
+
+## 2026-10-21 目录上传补齐
+
+本地目录通过 `cp --recursive` 或 `sync` 上传时，默认保留匹配的目录，包括空目录。`--disable-dir-object` 跳过显式目录上传，仅适用于本地目录上传方向；HNS/ADrive 的文件仍可能自动创建所需父目录。FNS 用以 `/` 结尾的零字节对象表示目录，HNS 目录使用 STANDARD，不套用文件的存储类型覆盖。普通清单和 `--no-manifest` 模式遵循相同目录规则。空源目录会创建可表达的目标文件夹，桶或空间根不创建空 Key；`--include-parent` 保留源目录名。目录计入项目数，字节数为零。关闭目录上传不会授权 `sync --delete` 删除源端仍存在的目录。
+
+递归上传中的目录是独立任务，创建失败进入失败汇总并阻止 sync 后续删除。ADrive 复用 CreateFolder，TOS 使用目录 PutObject；文件分片、摘要和并发逻辑保持既有实现。参见 [目录上传契约](superpowers/specs/2026-10-21-directory-upload-design.md)。

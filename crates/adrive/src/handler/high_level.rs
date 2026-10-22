@@ -41,6 +41,9 @@ use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
+use tos_core::agent::request_id::{
+    capture_service_request_id, current_service_request_id, without_operation_request_tracking,
+};
 use tos_core::infra::config::{
     Profile, DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY, DEFAULT_MULTIPART_CONCURRENCY,
     DEFAULT_OVERWRITE_STRATEGY, DEFAULT_PROGRESS_GRANULARITY, DEFAULT_TOS_BATCH_REPORT_FORMAT,
@@ -71,6 +74,18 @@ use crate::handler::common::{
     parse_adrive_uri, public_adrive_command_path, resolve_target, ParsedADriveUri,
 };
 use crate::registry::{find_capability, RegistryParameter};
+
+#[path = "directory_upload.rs"]
+mod directory_upload;
+use directory_upload::{
+    add_directory_upload_plan, collect_upload_directory_tasks, directory_upload_manifest,
+    execute_upload_directories, stream_upload_directory, validate_directory_upload_option,
+    DirectoryUploadState,
+};
+
+#[cfg(test)]
+#[path = "directory_upload_tests.rs"]
+mod directory_upload_tests;
 
 const ADRIVE_EXAMPLE_PREFIX_ENV: &str = "VE_STORAGE_UNI_ADRIVE_EXAMPLE_PREFIX";
 const INSTANCE_TABLE_COLUMNS: &[&str] = &[
@@ -163,6 +178,9 @@ struct BatchItemResult {
     operation: String,
     status: String,
     error: Option<String>,
+    // [Review Fix #ReportId1] Older report snapshots omit this per-operation field.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +288,7 @@ impl BatchReport {
             operation: operation.to_string(),
             status: "succeeded".to_string(),
             error: None,
+            request_id: None,
         });
     }
 
@@ -288,7 +307,26 @@ impl BatchReport {
             operation: operation.to_string(),
             status: "failed".to_string(),
             error: Some(error.to_string()),
+            request_id: None,
         });
+    }
+
+    fn push_operation_result(
+        &mut self,
+        source: String,
+        destination: Option<String>,
+        operation: &str,
+        (result, request_id): ADriveOperationResult,
+    ) {
+        match result {
+            Ok(()) => self.push_success(source, destination, operation),
+            Err(error) => self.push_failure(source, destination, operation, error),
+        }
+        // [Review Fix #ReportId2] Carry the ID with its own operation result;
+        // command-wide traces cannot identify concurrently completed rows.
+        if let Some(item) = self.items.last_mut() {
+            item.request_id = request_id;
+        }
     }
 
     fn push_skipped(&mut self, source: String, destination: Option<String>, operation: &str) {
@@ -300,6 +338,7 @@ impl BatchReport {
             operation: operation.to_string(),
             status: "skipped".to_string(),
             error: None,
+            request_id: None,
         });
     }
 }
@@ -309,13 +348,15 @@ struct BatchCheckpoint {
     completed: HashSet<String>,
 }
 
+type ADriveOperationResult = (Result<(), CliError>, Option<String>);
+
 type ADriveBatchFutureOutput = (
     String,
     Option<String>,
     String,
     u64,
     &'static str,
-    Result<(), CliError>,
+    ADriveOperationResult,
 );
 type ADriveBatchFuture<'a> = Pin<Box<dyn Future<Output = ADriveBatchFutureOutput> + 'a>>;
 
@@ -323,9 +364,9 @@ struct ADriveMoveFutureOutput {
     copy_source: String,
     copy_destination: Option<String>,
     copy_operation: &'static str,
-    copy_result: Result<(), CliError>,
+    copy_result: ADriveOperationResult,
     delete_source: String,
-    delete_result: Option<Result<(), CliError>>,
+    delete_result: Option<ADriveOperationResult>,
 }
 
 type ADriveMoveFuture<'a> = Pin<Box<dyn Future<Output = ADriveMoveFutureOutput> + 'a>>;
@@ -459,12 +500,24 @@ fn enforce_critical_confirmation(
 fn prevalidate_command(command: &ADriveCommand) -> Result<(), CliError> {
     match command {
         ADriveCommand::Cp(args) => {
+            validate_directory_upload_option(
+                &args.source,
+                &args.destination,
+                args.recursive,
+                args.disable_dir_object,
+            )?;
             validate_transfer_endpoints("ve-adrive cp", &args.source, &args.destination)
         }
         ADriveCommand::Mv(args) => {
             validate_transfer_endpoints("ve-adrive mv", &args.source, &args.destination)
         }
         ADriveCommand::Sync(args) => {
+            validate_directory_upload_option(
+                &args.source,
+                &args.destination,
+                true,
+                args.disable_dir_object,
+            )?;
             validate_transfer_endpoints("ve-adrive sync", &args.source, &args.destination)
         }
         ADriveCommand::Crt(args) => {
@@ -979,14 +1032,18 @@ async fn execute_cp(
 
     let source_is_remote = args.source.starts_with("adrive://");
     let dest_is_remote = args.destination.starts_with("adrive://");
-    match (source_is_remote, dest_is_remote) {
-        (false, true) => upload_file(global, profile, client, args, runtime).await,
-        (true, false) => download_file(global, client, args, runtime).await,
-        (true, true) => copy_remote_file(global, client, args, runtime).await,
-        (false, false) => Err(CliError::ValidationError(
-            "ve-adrive cp requires one side to be adrive://instance/space/path".to_string(),
-        )),
-    }
+    capture_service_request_id(async {
+        match (source_is_remote, dest_is_remote) {
+            (false, true) => upload_file(global, profile, client, args, runtime).await,
+            (true, false) => download_file(global, client, args, runtime).await,
+            (true, true) => copy_remote_file(global, client, args, runtime).await,
+            (false, false) => Err(CliError::ValidationError(
+                "ve-adrive cp requires one side to be adrive://instance/space/path".to_string(),
+            )),
+        }
+    })
+    .await
+    .0
 }
 
 async fn execute_recursive_cp(
@@ -1169,6 +1226,7 @@ async fn recursive_cp_streaming_no_manifest_report(
             report: &mut report,
             in_flight: FuturesUnordered::new(),
             limit: runtime.batch_concurrency.max(1),
+            directory_state: DirectoryUploadState::default(),
         };
         let result = match (
             args.source.starts_with("adrive://"),
@@ -1199,6 +1257,7 @@ struct ADriveStreamCpContext<'a> {
     report: &'a mut BatchReport,
     in_flight: FuturesUnordered<ADriveBatchFuture<'a>>,
     limit: usize,
+    directory_state: DirectoryUploadState,
 }
 
 impl<'a> ADriveStreamCpContext<'a> {
@@ -1255,14 +1314,18 @@ async fn stream_adrive_upload_no_manifest(
         recursive_adrive_source_parent_prefix(&context.args.source, context.args.include_parent)?;
     let mut pending = vec![source_root.clone()];
     while let Some(directory) = pending.pop() {
+        stream_upload_directory(context, &destination, &source_root, &directory, false).await?;
         let mut child_directories = Vec::new();
         for entry in sorted_adrive_read_dir_entries(&directory)? {
             let path = entry.path();
-            if path.is_dir() {
+            // [Review Fix #DirectorySymlink] Match manifest traversal without
+            // following symlink descendants into cycles or outside the source.
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
                 child_directories.push(path);
                 continue;
             }
-            if path.is_file() {
+            if file_type.is_file() {
                 queue_adrive_upload_file(
                     context,
                     &destination,
@@ -1298,6 +1361,9 @@ async fn queue_adrive_upload_file(
         context.args.exclude.as_deref(),
     ) {
         return Ok(());
+    }
+    if let Some(parent) = file.parent() {
+        stream_upload_directory(context, destination, source_root, parent, true).await?;
     }
     let remote_path = join_remote_path(&destination.path, &relative);
     let remote_target = format_target(&ParsedADriveUri {
@@ -1340,7 +1406,7 @@ async fn queue_adrive_upload_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let result = upload_adrive_file_for_batch(
+            let result = capture_service_request_id(upload_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -1350,7 +1416,7 @@ async fn queue_adrive_upload_file(
                 checkpoint_dir.as_deref(),
                 bandwidth_limit.as_deref(),
                 runtime,
-            )
+            ))
             .await;
             (
                 source_label,
@@ -1474,7 +1540,7 @@ async fn queue_adrive_download_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let result = download_adrive_file_for_batch(
+            let result = capture_service_request_id(download_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -1486,7 +1552,7 @@ async fn queue_adrive_download_file(
                 checkpoint_enabled,
                 bandwidth_limit.as_deref(),
                 runtime,
-            )
+            ))
             .await;
             (
                 remote_source,
@@ -1617,7 +1683,7 @@ async fn queue_adrive_remote_copy_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let result = copy_adrive_file_simple(
+            let result = capture_service_request_id(copy_adrive_file_simple(
                 client,
                 &instance,
                 &source_space,
@@ -1625,7 +1691,7 @@ async fn queue_adrive_remote_copy_file(
                 &destination_space,
                 &destination_path,
                 &source_etag,
-            )
+            ))
             .await;
             (
                 remote_source,
@@ -1681,19 +1747,26 @@ async fn upload_directory_recursive(
         let size = std::fs::metadata(&file)?.len();
         files.push((file, relative, size));
     }
-    scan_progress.finish_with_count(files.len() as u64, "file(s)");
+    let directory_tasks = collect_upload_directory_tasks(args, &destination)?;
+    scan_progress.finish_with_count((files.len() + directory_tasks.len()) as u64, "item(s)");
     let progress = batch_progress(
         "ve-adrive cp upload",
-        batch_progress_total(files.iter().map(|(_, _, size)| *size), runtime),
+        batch_progress_total(
+            files
+                .iter()
+                .map(|(_, _, size)| *size)
+                .chain(std::iter::repeat_n(0, directory_tasks.len())),
+            runtime,
+        ),
         progress_enabled,
     );
     let checkpoint_path = checkpoint_path_for_cp(args)?;
     let mut checkpoint = load_batch_checkpoint(checkpoint_path.as_deref()).await?;
     let mut report = BatchReport::new("ve-adrive cp");
     report.set_manifest(
-        files
-            .iter()
-            .map(|(file, relative, size)| {
+        directory_upload_manifest(&destination, &directory_tasks)
+            .into_iter()
+            .chain(files.iter().map(|(file, relative, size)| {
                 let remote_path = join_remote_path(&destination.path, relative);
                 BatchManifestItem {
                     operation: "upload".to_string(),
@@ -1707,9 +1780,25 @@ async fn upload_directory_recursive(
                     etag: None,
                     crc64: None,
                 }
-            })
+            }))
             .collect(),
     );
+    {
+        let mut context = ADriveStreamCpContext {
+            client,
+            args,
+            runtime,
+            progress: &progress,
+            checkpoint_path: checkpoint_path.clone(),
+            checkpoint,
+            report: &mut report,
+            in_flight: FuturesUnordered::new(),
+            limit: runtime.batch_concurrency.max(1),
+            directory_state: DirectoryUploadState::default(),
+        };
+        execute_upload_directories(&mut context, &destination, directory_tasks).await?;
+        checkpoint = context.checkpoint;
+    }
     let mut in_flight = FuturesUnordered::new();
     for (file, relative, file_size) in files {
         while in_flight.len() >= runtime.batch_concurrency {
@@ -1772,7 +1861,7 @@ async fn upload_directory_recursive(
         let checkpoint_dir = args.checkpoint_dir.clone();
         let bandwidth_limit = args.bandwidth_limit.clone();
         in_flight.push(async move {
-            let result = upload_adrive_file_for_batch(
+            let result = capture_service_request_id(upload_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -1782,7 +1871,7 @@ async fn upload_directory_recursive(
                 checkpoint_dir.as_deref(),
                 bandwidth_limit.as_deref(),
                 runtime,
-            )
+            ))
             .await;
             (source, destination_label, item_key, progress_units, result)
         });
@@ -1926,7 +2015,7 @@ async fn download_directory_recursive(
         let checkpoint_enabled = args.checkpoint;
         let bandwidth_limit = args.bandwidth_limit.clone();
         in_flight.push(async move {
-            let result = download_adrive_file_for_batch(
+            let result = capture_service_request_id(download_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -1938,7 +2027,7 @@ async fn download_directory_recursive(
                 checkpoint_enabled,
                 bandwidth_limit.as_deref(),
                 runtime,
-            )
+            ))
             .await;
             (
                 remote_source,
@@ -2101,7 +2190,7 @@ async fn copy_remote_recursive(
         let destination_space = destination.space.clone();
         let source_etag = file.etag.clone();
         in_flight.push(async move {
-            let result = copy_adrive_file_simple(
+            let result = capture_service_request_id(copy_adrive_file_simple(
                 client,
                 &instance,
                 &source_space,
@@ -2109,7 +2198,7 @@ async fn copy_remote_recursive(
                 &destination_space,
                 &destination_path,
                 &source_etag,
-            )
+            ))
             .await;
             (
                 remote_source,
@@ -2365,13 +2454,13 @@ async fn upload_file_multipart(
                 if !args.checkpoint {
                     // [Review Fix #6] Non-checkpoint multipart uploads cannot
                     // resume safely, so abort failed upload sessions.
-                    let _ = abort_adrive_multipart_upload(
+                    let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
                         client,
                         &dest.instance,
                         &dest.space,
                         &file_path,
                         &upload_id,
-                    )
+                    ))
                     .await;
                 }
                 return Err(err);
@@ -2403,19 +2492,21 @@ async fn upload_file_multipart(
             })
             .collect(),
     };
+    // [Review Fix #ReportId5] Failure cleanup must retain the failed operation ID,
+    // including explicit absence when its final response has no usable ID.
     let out = match client.complete_multipart_upload(&complete).await {
         Ok(out) => out,
         Err(err) => {
             if !args.checkpoint {
                 // [Review Fix #7] Abort non-checkpoint multipart uploads when
                 // CompleteMultipartUpload fails after parts were uploaded.
-                let _ = abort_adrive_multipart_upload(
+                let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
                     client,
                     &dest.instance,
                     &dest.space,
                     &file_path,
                     &upload_id,
-                )
+                ))
                 .await;
             }
             return Err(map_ids_error(err));
@@ -2673,13 +2764,13 @@ async fn upload_adrive_file_multipart_for_batch(
                 if !checkpoint_enabled {
                     // [Review Fix #8] Batch multipart uploads without
                     // checkpoint state should not leave orphaned parts.
-                    let _ = abort_adrive_multipart_upload(
+                    let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
                         client,
                         instance,
                         space,
                         remote_path,
                         &upload_id,
-                    )
+                    ))
                     .await;
                 }
                 return Err(err);
@@ -2709,15 +2800,22 @@ async fn upload_adrive_file_multipart_for_batch(
             })
             .collect(),
     };
+    // [Review Fix #ReportId5] Failure cleanup must retain the failed operation ID,
+    // including explicit absence when its final response has no usable ID.
     let out = match client.complete_multipart_upload(&complete).await {
         Ok(out) => out,
         Err(err) => {
             if !checkpoint_enabled {
                 // [Review Fix #9] Complete failure after non-checkpoint batch
                 // upload should abort the service-side multipart session.
-                let _ =
-                    abort_adrive_multipart_upload(client, instance, space, remote_path, &upload_id)
-                        .await;
+                let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
+                    client,
+                    instance,
+                    space,
+                    remote_path,
+                    &upload_id,
+                ))
+                .await;
             }
             return Err(map_ids_error(err));
         }
@@ -2871,15 +2969,13 @@ async fn record_adrive_batch_result(
     destination: Option<String>,
     item_key: String,
     progress_units: u64,
-    result: Result<(), CliError>,
+    result: ADriveOperationResult,
 ) -> Result<(), CliError> {
-    match result {
-        Ok(()) => {
-            report.push_success(source, destination, operation);
-            checkpoint.completed.insert(item_key);
-            save_batch_checkpoint(checkpoint_path, checkpoint).await?;
-        }
-        Err(err) => report.push_failure(source, destination, operation, err),
+    let is_success = result.0.is_ok();
+    report.push_operation_result(source, destination, operation, result);
+    if is_success {
+        checkpoint.completed.insert(item_key);
+        save_batch_checkpoint(checkpoint_path, checkpoint).await?;
     }
     tick_progress_by(progress, progress_units);
     Ok(())
@@ -3483,6 +3579,7 @@ async fn execute_mv(
             by_name: false,
             recursive: true,
             include_parent: args.include_parent,
+            disable_dir_object: true,
             include: args.include.clone(),
             exclude: args.exclude.clone(),
             checkpoint: false,
@@ -3529,19 +3626,30 @@ async fn execute_mv(
                 report.push_skipped(item.source.clone(), None, "delete-source");
             }
         } else {
-            match cleanup_recursive_move_source(client, &args.source).await {
+            let (cleanup_result, request_id) =
+                capture_service_request_id(cleanup_recursive_move_source(client, &args.source))
+                    .await;
+            match cleanup_result {
                 Ok(()) => {
                     for item in &delete_manifest_items {
-                        report.push_success(item.source.clone(), None, "delete-source");
+                        report.push_operation_result(
+                            item.source.clone(),
+                            None,
+                            "delete-source",
+                            (Ok(()), request_id.clone()),
+                        );
                     }
                 }
                 Err(err) => {
                     for item in &delete_manifest_items {
-                        report.push_failure(
+                        report.push_operation_result(
                             item.source.clone(),
                             None,
                             "delete-source",
-                            err.to_string(),
+                            (
+                                Err(CliError::TransferFailed(err.to_string())),
+                                request_id.clone(),
+                            ),
                         );
                     }
                 }
@@ -3640,6 +3748,7 @@ fn effective_mv_runtime_config(
         by_name: false,
         recursive: true,
         include_parent: args.include_parent,
+        disable_dir_object: true,
         include: args.include.clone(),
         exclude: args.exclude.clone(),
         checkpoint: false,
@@ -3702,14 +3811,14 @@ async fn execute_recursive_mv_streaming_no_manifest(
         context.drain_all().await;
         result
     };
-    let cleanup_result = if stream_result.is_ok()
+    let (cleanup_result, cleanup_request_id) = if stream_result.is_ok()
         && report.failed == 0
         && args.include.is_none()
         && args.exclude.is_none()
     {
-        cleanup_recursive_move_source(client, &args.source).await
+        capture_service_request_id(cleanup_recursive_move_source(client, &args.source)).await
     } else {
-        Ok(())
+        (Ok(()), None)
     };
     if stream_result.is_ok()
         && report.failed == 0
@@ -3717,12 +3826,20 @@ async fn execute_recursive_mv_streaming_no_manifest(
         && args.exclude.is_none()
     {
         match &cleanup_result {
-            Ok(()) => report.push_success(args.source.clone(), None, "delete-source-root"),
-            Err(err) => report.push_failure(
+            Ok(()) => report.push_operation_result(
                 args.source.clone(),
                 None,
                 "delete-source-root",
-                err.to_string(),
+                (Ok(()), cleanup_request_id),
+            ),
+            Err(err) => report.push_operation_result(
+                args.source.clone(),
+                None,
+                "delete-source-root",
+                (
+                    Err(CliError::TransferFailed(err.to_string())),
+                    cleanup_request_id,
+                ),
             ),
         }
         tick_progress(&progress);
@@ -3866,7 +3983,7 @@ async fn queue_adrive_upload_move_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let copy_result = upload_adrive_file_for_batch(
+            let copy_result = capture_service_request_id(upload_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -3876,10 +3993,15 @@ async fn queue_adrive_upload_move_file(
                 checkpoint_dir.as_deref(),
                 None,
                 runtime,
-            )
+            ))
             .await;
-            let delete_result = if copy_result.is_ok() {
-                Some(tokio::fs::remove_file(&file).await.map_err(CliError::Io))
+            let delete_result = if copy_result.0.is_ok() {
+                Some(
+                    capture_service_request_id(async {
+                        tokio::fs::remove_file(&file).await.map_err(CliError::Io)
+                    })
+                    .await,
+                )
             } else {
                 None
             };
@@ -3985,7 +4107,7 @@ async fn queue_adrive_download_move_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let copy_result = download_adrive_file_for_batch(
+            let copy_result = capture_service_request_id(download_adrive_file_for_batch(
                 client,
                 &instance,
                 &space,
@@ -3997,15 +4119,18 @@ async fn queue_adrive_download_move_file(
                 false,
                 None,
                 runtime,
-            )
+            ))
             .await;
-            let delete_result = if copy_result.is_ok() {
+            let delete_result = if copy_result.0.is_ok() {
                 Some(
-                    client
-                        .delete_file(&DeleteFileInput::new(&instance, &space, &file_path))
-                        .await
-                        .map(|_| ())
-                        .map_err(map_ids_error),
+                    capture_service_request_id(async {
+                        client
+                            .delete_file(&DeleteFileInput::new(&instance, &space, &file_path))
+                            .await
+                            .map(|_| ())
+                            .map_err(map_ids_error)
+                    })
+                    .await,
                 )
             } else {
                 None
@@ -4116,7 +4241,7 @@ async fn queue_adrive_remote_move_file(
     let client = context.client;
     context
         .queue(Box::pin(async move {
-            let copy_result = copy_adrive_file_simple(
+            let copy_result = capture_service_request_id(copy_adrive_file_simple(
                 client,
                 &instance,
                 &source_space,
@@ -4124,19 +4249,22 @@ async fn queue_adrive_remote_move_file(
                 &destination_space,
                 &destination_path,
                 &source_etag,
-            )
+            ))
             .await;
-            let delete_result = if copy_result.is_ok() {
+            let delete_result = if copy_result.0.is_ok() {
                 Some(
-                    client
-                        .delete_file(&DeleteFileInput::new(
-                            &instance,
-                            &source_space,
-                            &source_path,
-                        ))
-                        .await
-                        .map(|_| ())
-                        .map_err(map_ids_error),
+                    capture_service_request_id(async {
+                        client
+                            .delete_file(&DeleteFileInput::new(
+                                &instance,
+                                &source_space,
+                                &source_path,
+                            ))
+                            .await
+                            .map(|_| ())
+                            .map_err(map_ids_error)
+                    })
+                    .await,
                 )
             } else {
                 None
@@ -4159,27 +4287,22 @@ fn record_adrive_stream_move_result(
     report: &mut BatchReport,
     result: ADriveMoveFutureOutput,
 ) {
-    match result.copy_result {
-        Ok(()) => report.push_success(
-            result.copy_source,
-            result.copy_destination,
-            result.copy_operation,
-        ),
-        Err(err) => {
-            report.push_failure(
-                result.copy_source,
-                result.copy_destination,
-                result.copy_operation,
-                err,
-            );
-            report.push_skipped(result.delete_source, None, "delete-source");
-            tick_progress_by(progress, 2);
-            return;
-        }
+    let is_copy_success = result.copy_result.0.is_ok();
+    report.push_operation_result(
+        result.copy_source,
+        result.copy_destination,
+        result.copy_operation,
+        result.copy_result,
+    );
+    if !is_copy_success {
+        report.push_skipped(result.delete_source, None, "delete-source");
+        tick_progress_by(progress, 2);
+        return;
     }
     match result.delete_result {
-        Some(Ok(())) => report.push_success(result.delete_source, None, "delete-source"),
-        Some(Err(err)) => report.push_failure(result.delete_source, None, "delete-source", err),
+        Some(outcome) => {
+            report.push_operation_result(result.delete_source, None, "delete-source", outcome)
+        }
         None => report.push_skipped(result.delete_source, None, "delete-source"),
     }
     tick_progress_by(progress, 2);
@@ -4199,6 +4322,7 @@ async fn execute_sync(
         by_name: false,
         recursive: true,
         include_parent: args.include_parent,
+        disable_dir_object: args.disable_dir_object,
         include: args.include.clone(),
         exclude: args.exclude.clone(),
         checkpoint: true,
@@ -4756,7 +4880,17 @@ async fn execute_rm(
         });
         if args.recursive && args.recursive_delete_mode == RecursiveDeleteMode::Direct {
             let mut report = BatchReport::new("ve-adrive rm");
-            report.push_success(format_target(&target), None, "delete_folder");
+            report.push_operation_result(
+                format_target(&target),
+                None,
+                "delete_folder",
+                (
+                    Ok(()),
+                    tos_core::agent::request_id::sanitize_request_id(
+                        out.response_info.request_id(),
+                    ),
+                ),
+            );
             direct_recursive_report = Some(report);
         }
         response
@@ -5272,26 +5406,27 @@ async fn delete_adrive_entry_group(
             let source = format_adrive_entry_target(target, entry.path());
             let operation = entry.operation().to_string();
             in_flight.push(async move {
-                let result = match &entry {
-                    ADriveDeleteEntry::File(path) => client
-                        .delete_file(&DeleteFileInput::new(&instance, &space, path))
-                        .await
-                        .map(|_| ()),
-                    ADriveDeleteEntry::Folder(path) => client
-                        .delete_folder(&DeleteFolderInput::new(&instance, &space, path))
-                        .await
-                        .map(|_| ()),
-                };
+                let result = capture_service_request_id(async {
+                    match &entry {
+                        ADriveDeleteEntry::File(path) => client
+                            .delete_file(&DeleteFileInput::new(&instance, &space, path))
+                            .await
+                            .map(|_| ()),
+                        ADriveDeleteEntry::Folder(path) => client
+                            .delete_folder(&DeleteFolderInput::new(&instance, &space, path))
+                            .await
+                            .map(|_| ()),
+                    }
+                    .map_err(map_ids_error)
+                })
+                .await;
                 (source, operation, result)
             });
         }
         let Some((source, operation, result)) = in_flight.next().await else {
             break;
         };
-        match result {
-            Ok(()) => report.push_success(source, None, &operation),
-            Err(err) => report.push_failure(source, None, &operation, map_ids_error(err)),
-        }
+        report.push_operation_result(source, None, &operation, result);
         tick_progress(progress);
     }
 }
@@ -6917,13 +7052,13 @@ async fn put_adrive_multipart_stdin_file(
         Err(err) => {
             // [Review Fix #4] Stdin multipart has no checkpoint state; abort
             // failed sessions immediately so uploaded parts do not linger.
-            let _ = abort_adrive_multipart_upload(
+            let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
                 client,
                 &target.instance,
                 &target.space,
                 &target.path,
                 &initiated.upload_id,
-            )
+            ))
             .await;
             return Err(err);
         }
@@ -6935,18 +7070,20 @@ async fn put_adrive_multipart_stdin_file(
         upload_id: initiated.upload_id.clone(),
         parts,
     };
+    // [Review Fix #ReportId5] Failure cleanup must retain the failed operation ID,
+    // including explicit absence when its final response has no usable ID.
     let out = match client.complete_multipart_upload(&complete).await {
         Ok(out) => out,
         Err(err) => {
             // [Review Fix #5] CompleteMultipartUpload can fail after all parts
             // are uploaded; abort that upload id before surfacing the error.
-            let _ = abort_adrive_multipart_upload(
+            let _ = without_operation_request_tracking(abort_adrive_multipart_upload(
                 client,
                 &target.instance,
                 &target.space,
                 &target.path,
                 &initiated.upload_id,
-            )
+            ))
             .await;
             return Err(map_ids_error(err));
         }
@@ -7084,30 +7221,27 @@ async fn abort_checkpointed_multipart_uploads_for_rm(
             continue;
         };
         let source = format_adrive_upload_target(&upload.checkpoint, upload_id);
-        let result = abort_adrive_multipart_upload(
+        let result = capture_service_request_id(abort_adrive_multipart_upload(
             client,
             &upload.checkpoint.instance,
             &upload.checkpoint.space,
             &upload.checkpoint.file_path,
             upload_id,
-        )
+        ))
         .await;
-        match result {
-            Ok(()) => {
-                report.push_success(source, None, "abort-upload");
-                if let Err(err) = remove_checkpoint_file(Some(upload.path.as_path())).await {
-                    // [Review Fix #ADrive-RmUploads-2] The remote upload is
-                    // already aborted; keep going and surface local checkpoint
-                    // cleanup failure through the same batch summary.
-                    report.push_failure(
-                        upload.path.display().to_string(),
-                        None,
-                        "remove-checkpoint",
-                        err,
-                    );
-                }
+        let is_aborted = result.0.is_ok();
+        report.push_operation_result(source, None, "abort-upload", result);
+        if is_aborted {
+            if let Err(err) = remove_checkpoint_file(Some(upload.path.as_path())).await {
+                // [Review Fix #ReportId4] Local checkpoint cleanup has no response
+                // and must never inherit the preceding abort request's ID.
+                report.push_failure(
+                    upload.path.display().to_string(),
+                    None,
+                    "remove-checkpoint",
+                    err,
+                );
             }
-            Err(err) => report.push_failure(source, None, "abort-upload", err),
         }
         tick_progress(&progress);
     }
@@ -8016,6 +8150,7 @@ const ADRIVE_REPORT_COLUMNS: &[&str] = &[
     "destination",
     "status",
     "error",
+    "request_id",
 ];
 
 struct RollingCsvWriter {
@@ -8126,7 +8261,7 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn adrive_report_record(report: &BatchReport, item: &BatchItemResult) -> [String; 6] {
+fn adrive_report_record(report: &BatchReport, item: &BatchItemResult) -> [String; 7] {
     [
         // [Review Fix #6] CSV reports are user-facing artifacts, while the
         // internal batch executor still keys reports by registry command.
@@ -8136,6 +8271,7 @@ fn adrive_report_record(report: &BatchReport, item: &BatchItemResult) -> [String
         item.destination.clone().unwrap_or_default(),
         item.status.clone(),
         item.error.clone().unwrap_or_default(),
+        item.request_id.clone().unwrap_or_default(),
     ]
 }
 
@@ -8358,7 +8494,13 @@ async fn write_adrive_single_report(
             operation: operation.to_string(),
             status: "failed".to_string(),
             error,
+            request_id: None,
         }),
+    }
+    if status != "skipped" {
+        if let Some(item) = report.items.last_mut() {
+            item.request_id = current_service_request_id();
+        }
     }
     write_batch_report(Some(path), &report, false, false).await
 }
@@ -8955,6 +9097,10 @@ fn checkpoint_path_for_cp(args: &CpArgs) -> Result<Option<PathBuf>, CliError> {
     args.include.hash(&mut hasher);
     args.exclude.hash(&mut hasher);
     args.recursive.hash(&mut hasher);
+    // [Review Fix #DirectoryCheckpoint] Directory policy and root mapping are
+    // part of the logical task, so changed policies cannot reuse old skips.
+    args.include_parent.hash(&mut hasher);
+    args.disable_dir_object.hash(&mut hasher);
     let fingerprint = hasher.finish();
     Ok(Some(dir.join(format!("cp-{fingerprint:016x}.json"))))
 }
@@ -9730,22 +9876,19 @@ async fn delete_adrive_sync_delete_item_group(
                 break;
             };
             in_flight.push(async move {
-                let result = execute_adrive_sync_delete_item(client, &item).await;
+                let result =
+                    capture_service_request_id(execute_adrive_sync_delete_item(client, &item))
+                        .await;
                 (item, result)
             });
         }
         let Some((item, result)) = in_flight.next().await else {
             break;
         };
-        match result {
-            Ok(()) => {
-                deleted += 1;
-                report.push_success(item.source, None, &item.operation);
-            }
-            Err(err) => {
-                report.push_failure(item.source, None, &item.operation, err);
-            }
+        if result.0.is_ok() {
+            deleted += 1;
         }
+        report.push_operation_result(item.source, None, &item.operation, result);
         tick_progress(progress);
     }
     Ok(deleted)
@@ -9797,6 +9940,11 @@ fn collect_local_sync_desired_relative_paths(
     exclude: Option<&str>,
 ) -> Result<SyncDesiredRelativePaths, CliError> {
     let mut desired = SyncDesiredRelativePaths::default();
+    // [Review Fix #DirectorySyncRoot] An empty include-parent source still
+    // represents its root folder, including when explicit creation is disabled.
+    if let Some(parent) = parent_prefix {
+        add_relative_folder_with_parents(&mut desired.folders, parent);
+    }
     collect_local_sync_desired_relative_paths_inner(
         source_root,
         source_root,
@@ -10347,6 +10495,9 @@ fn parameter_schema_type(name: &str) -> &'static str {
         "by-name"
             | "recursive"
             | "include-parent"
+            // [Review Fix #DirectorySchema] Discovery must match Clap's
+            // valueless boolean switch for MCP and agent clients.
+            | "disable-dir-object"
             | "force"
             | "delete"
             | "size-only"
@@ -10695,6 +10846,21 @@ async fn build_plan(
     auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<serde_json::Value, CliError> {
+    match command {
+        ADriveCommand::Cp(args) => validate_directory_upload_option(
+            &args.source,
+            &args.destination,
+            args.recursive,
+            args.disable_dir_object,
+        )?,
+        ADriveCommand::Sync(args) => validate_directory_upload_option(
+            &args.source,
+            &args.destination,
+            true,
+            args.disable_dir_object,
+        )?,
+        _ => {}
+    }
     // Resolve authentication before command-specific planning so OAuth-only
     // owner/listing rules are applied consistently in dry-run.
     let runtime = build_adrive_dry_run_runtime(global, auth.auth_mode)?;
@@ -11113,6 +11279,8 @@ async fn build_plan(
             json!(recursive_delete_mode_name(args.recursive_delete_mode));
     }
 
+    add_directory_upload_plan(&mut plan, command);
+
     Ok(plan)
 }
 
@@ -11144,6 +11312,111 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn report_request_id_is_appended_to_csv_and_deserialized() {
+        let item: BatchItemResult = serde_json::from_value(json!({
+            "source": "adrive://inst/space/file", "destination": null,
+            "operation": "copy", "status": "succeeded", "error": null,
+            "request_id": "row-service-id",
+        }))
+        .unwrap();
+        let record = adrive_report_record(&BatchReport::new("ve-adrive cp"), &item);
+        assert_eq!(ADRIVE_REPORT_COLUMNS.last(), Some(&"request_id"));
+        assert_eq!(record.last().map(String::as_str), Some("row-service-id"));
+    }
+
+    #[tokio::test]
+    async fn report_request_id_does_not_reuse_response_after_transport_failure() {
+        let trace = tos_core::agent::request_id::ServiceRequestTrace::default();
+        let outcome = capture_service_request_id(async {
+            trace.record_response(Some("previous-attempt"), true);
+            trace.record_no_response();
+            Err(CliError::TransferFailed("transport failed".into()))
+        })
+        .await;
+        let mut report = BatchReport::new("ve-adrive cp");
+        report.push_operation_result("source".into(), None, "upload", outcome);
+        assert_eq!(report.items[0].status, "failed");
+        assert_eq!(report.items[0].request_id, None);
+    }
+
+    #[test]
+    fn report_request_id_keeps_move_copy_and_delete_separate() {
+        let mut report = BatchReport::new("ve-adrive mv");
+        record_adrive_stream_move_result(
+            &None,
+            &mut report,
+            ADriveMoveFutureOutput {
+                copy_source: "source".into(),
+                copy_destination: Some("destination".into()),
+                copy_operation: "copy",
+                copy_result: (Ok(()), Some("copy-id".into())),
+                delete_source: "source".into(),
+                delete_result: Some((
+                    Err(CliError::PermissionDenied("denied".into())),
+                    Some("delete-id".into()),
+                )),
+            },
+        );
+        assert_eq!(report.items[0].request_id.as_deref(), Some("copy-id"));
+        assert_eq!(report.items[1].request_id.as_deref(), Some("delete-id"));
+        assert_eq!(report.items[1].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn report_request_id_single_writer_uses_only_active_scope() {
+        let path = std::env::temp_dir().join(format!(
+            "adrive-single-request-id-{}.csv",
+            ulid::Ulid::new()
+        ));
+        let trace = tos_core::agent::request_id::ServiceRequestTrace::default();
+        capture_service_request_id(async {
+            trace.record_response(Some("single-id"), true);
+            write_adrive_single_report(
+                path.to_str(),
+                "ve-adrive cp",
+                "source".into(),
+                None,
+                "upload",
+                "succeeded",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        let rolled_path = rolled_csv_path(&path, 1);
+        let contents = fs::read_to_string(&rolled_path).unwrap();
+        assert!(contents.lines().nth(1).unwrap().ends_with(",single-id"));
+        write_adrive_single_report(
+            path.to_str(),
+            "ve-adrive cp",
+            "source".into(),
+            None,
+            "upload",
+            "failed",
+            Some("failure".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let contents = fs::read_to_string(&rolled_path).unwrap();
+        assert!(contents.lines().nth(1).unwrap().ends_with(",failure,"));
+        fs::remove_file(rolled_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_report_request_id_is_empty_in_csv() {
+        let item: BatchItemResult = serde_json::from_value(json!({
+            "source": "local-file", "destination": null,
+            "operation": "remove-checkpoint", "status": "failed", "error": "io error",
+        }))
+        .unwrap();
+        let record = adrive_report_record(&BatchReport::new("ve-adrive rm"), &item);
+        assert_eq!(record.last().map(String::as_str), Some(""));
+    }
 
     fn create_args() -> CreateArgs {
         CreateArgs {

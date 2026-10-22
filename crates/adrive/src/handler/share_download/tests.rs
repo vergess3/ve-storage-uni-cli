@@ -97,27 +97,78 @@ async fn explicit_download_denial_retains_permission_diagnostics() {
 #[test]
 fn early_download_denial_gets_owner_guidance_without_changing_other_errors() {
     let denial = "ids server error: [Forbidden.ShareDownloadDisabled] denied (status=403)";
-    let permission = CliError::PermissionDenied(denial.into());
+    let permission = map_ids_error(Error::Server(crate::domain::client::IdsError {
+        code: "Forbidden.ShareDownloadDisabled".into(),
+        message: "denied".into(),
+        request_id: Some("early-denied-request".into()),
+        status_code: Some(403),
+        response_headers: None,
+    }));
     let (envelope, code) = aggregate(&Progress::default(), Some(permission));
     assert_eq!(code, 5);
     let detail = envelope.error.unwrap();
-    assert_eq!(detail.status_code, None);
+    assert_eq!(detail.status_code, Some(403));
+    assert_eq!(envelope.request_id.as_deref(), Some("early-denied-request"));
     assert_eq!(
         detail.message,
-        "Share download is disabled by the share permission"
+        "Share download is blocked; share permission or download-count quota may prevent it"
     );
-    assert!(detail.suggested_action.unwrap().contains("share owner"));
+    let action = detail.suggested_action.unwrap();
+    assert!(
+        action.contains("share owner") && action.contains("permission") && action.contains("quota")
+    );
 
-    for error in [
-        CliError::PermissionDenied("[Forbidden.ShareRequireLogin] denied".into()),
-        CliError::ValidationError(denial.into()),
+    for (error, expected_message) in [
+        (
+            CliError::PermissionDenied("[Forbidden.ShareRequireLogin] denied".into()),
+            "denied",
+        ),
+        (
+            CliError::ValidationError(denial.into()),
+            "denied (status=403)",
+        ),
     ] {
         let (envelope, _) = aggregate(&Progress::default(), Some(error));
-        assert!(!envelope
-            .error
-            .unwrap()
+        let detail = envelope.error.unwrap();
+        assert_eq!(detail.message, expected_message);
+        assert!(!detail
             .message
-            .contains("download is disabled"));
+            .contains("permission or download-count quota"));
+    }
+}
+
+#[tokio::test]
+async fn early_token_denial_retains_http_status_and_request_identity() {
+    for request_id in [Some("token-denial-request"), None] {
+        let response = reply(403, r#"{"Code":"Forbidden.ShareDownloadDisabled"}"#);
+        let response = match request_id {
+            Some(request_id) => response.replace("fixture-id", request_id),
+            None => response.replace("x-ids-request-id: fixture-id\r\n", ""),
+        };
+        let service = Fixture::new(vec![reply(200, r#"{"ShareID":"s"}"#), response]);
+        let destination = Destination::new();
+        let mut progress = Progress::default();
+        let error = execute(
+            &GlobalArgs::default(),
+            &destination.args(&service.endpoint),
+            &mut progress,
+        )
+        .await
+        .unwrap_err();
+        let (envelope, code) = aggregate(&progress, Some(error));
+        assert_eq!(code, 5);
+        assert_eq!(envelope.status_code, Some(403));
+        assert_eq!(
+            envelope.ec.as_deref(),
+            Some("Forbidden.ShareDownloadDisabled")
+        );
+        assert_eq!(envelope.request_id.as_deref(), request_id);
+        let detail = envelope.error.unwrap();
+        assert_eq!(detail.status_code, Some(403));
+        assert!(matches!(detail.kind, ErrorKind::PermissionDenied));
+        assert!(detail.suggested_action.unwrap().contains("quota"));
+        assert!(!destination.0.join("output").exists());
+        assert_eq!(service.finish().len(), 2);
     }
 }
 
@@ -383,6 +434,43 @@ async fn all_existing_file_conflicts_are_checked_before_signing() {
     );
     assert_eq!(service.finish().len(), 3);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_destination_leaf_reports_local_conflict_before_signing() {
+    for is_link in [false, true] {
+        let mut responses = auth();
+        responses.push(metadata());
+        let service = Fixture::new(responses);
+        let destination = Destination::new();
+        let output = destination.0.join("output");
+        std::fs::create_dir(&output).unwrap();
+        if is_link {
+            std::fs::write(destination.0.join("kept"), "keep").unwrap();
+            std::os::unix::fs::symlink(destination.0.join("kept"), output.join("a.txt")).unwrap();
+        } else {
+            std::fs::create_dir(output.join("a.txt")).unwrap();
+        }
+        let mut progress = Progress::default();
+        let error = execute(
+            &GlobalArgs::default(),
+            &destination.args(&service.endpoint),
+            &mut progress,
+        )
+        .await
+        .unwrap_err();
+        let (envelope, code) = aggregate(&progress, Some(error));
+        assert_eq!(code, 9);
+        let detail = envelope.error.unwrap();
+        assert!(matches!(detail.kind, ErrorKind::Conflict));
+        let guidance = detail.suggested_action.unwrap();
+        assert!(guidance.contains("local destination") && guidance.contains("directory"));
+        assert!(!guidance.contains("IAM") && !guidance.contains("doctor"));
+        assert!(detail.fix_command.is_none() && detail.doctor_hint.is_none());
+        assert!(progress.journal.is_some());
+        assert_eq!(service.finish().len(), 3);
+    }
+}
 #[tokio::test]
 async fn unknown_signing_outcome_is_not_replayed() {
     let mut responses = auth();
@@ -426,7 +514,7 @@ async fn content_retry_reuses_one_signed_address() {
 }
 #[tokio::test]
 async fn local_change_and_remote_change_prevent_resume_before_new_signature() {
-    for is_local_change in [true, false] {
+    for replacement in [Some("xyz"), Some("ab"), Some("abcd"), None] {
         let content = Fixture::new(vec![content_reply()]);
         let mut responses = auth();
         responses.push(metadata());
@@ -435,7 +523,7 @@ async fn local_change_and_remote_change_prevent_resume_before_new_signature() {
             &json!({"DownloadURL":format!("{}/blob",content.endpoint)}).to_string(),
         ));
         responses.extend(auth());
-        responses.push(if is_local_change {
+        responses.push(if replacement.is_some() {
             metadata()
         } else {
             metadata().replace("abc", "xyz")
@@ -448,8 +536,8 @@ async fn local_change_and_remote_change_prevent_resume_before_new_signature() {
             .await
             .unwrap();
         drop(progress);
-        if is_local_change {
-            std::fs::write(destination.0.join("output/a.txt"), b"xyz").unwrap();
+        if let Some(contents) = replacement {
+            std::fs::write(destination.0.join("output/a.txt"), contents).unwrap();
         }
         let checkpoint_path = args.checkpoint.as_deref().unwrap();
         let checkpoint_before = std::fs::read(checkpoint_path).unwrap();
@@ -459,6 +547,7 @@ async fn local_change_and_remote_change_prevent_resume_before_new_signature() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("changed since checkpoint"));
+        assert_eq!(error.exit_code(), ExitCode::Conflict, "{error}");
         let summary = aggregate(&progress, Some(error)).0.data.unwrap()["Summary"].clone();
         assert_eq!(
             summary["Completed"], 0,

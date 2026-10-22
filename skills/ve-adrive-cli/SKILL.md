@@ -119,7 +119,9 @@ status and Auth Doctor during setup; run the generic Doctor after configuration.
 
 ADrive has independent Resource and OAuth Authorization Server endpoints. Resource commands require an explicit
 endpoint; a recognizable IDS endpoint may supply region, while a custom endpoint also needs an explicit region. New
-OAuth logins additionally require an explicit Auth endpoint. The Resource and Auth endpoints must use different origins.
+OAuth login selects `--auth-endpoint` > profile `auth_endpoint` > `ADRIVE_AUTH_ENDPOINT` > the effective
+Resource endpoint. Resource and Auth may share the same origin. Explicit HTTP and HTTPS are supported without
+protocol upgrades; bare hosts default to HTTPS. Refresh remains pinned to the endpoint saved at login.
 
 Endpoint values without a scheme default to `https://`; dotless service names with numeric ports, such as
 `resource:9000`, are treated as hosts. Resource endpoints with an explicit non-HTTP (S) scheme are rejected before any
@@ -167,11 +169,11 @@ ve-adrive-cli ls adrive://<instance-id> --output json
 Default to OAuth for a user's cloud drive. When the user asks to set up or log in, configure the selected Profile once
 so later Resource commands stay short. For normal public ADrive, require only the Instance ID and use:
 
-- Auth base URL: `https://<instance-id>.idsauth.volces.com`
+- Auth base URL: defaults to the configured Resource endpoint; set `auth_endpoint` only when a separate Auth service is required.
 - Resource base URL: `https://idsapi.volces.com`
 - Resource signing region: `cn-beijing`
 
-The Auth host is Instance-scoped. The Resource host is shared; the CLI appends
+An explicitly configured Auth host may be Instance-scoped. The shared Resource endpoint remains independently configurable; the CLI appends
 `/v1/instances/<instance-id>/...` to Resource requests.
 
 The signing region is a CLI connection input, not a discovered statement about where the Instance is physically
@@ -183,7 +185,6 @@ requests a non-persistent invocation, pass the same values as command or environ
 
 ```bash
 ve-adrive-cli config set auth_mode oauth
-ve-adrive-cli config set auth_endpoint https://<instance-id>.idsauth.volces.com
 ve-adrive-cli config set endpoint https://idsapi.volces.com
 ve-adrive-cli config set region cn-beijing
 ve-adrive-cli config set default_instance <instance-id>
@@ -307,6 +308,8 @@ ve-adrive-cli mkdir \
   adrive://<instance-id>/<space-id>/new-folder
 ```
 
+Local-directory uploads with `cp --recursive` and `sync` preserve selected directories, including empty directories, by default. `--disable-dir-object` skips explicit directory uploads; it is valid only for local-directory uploads. Files can still create required parents in HNS/ADrive. ADrive preserves directories with its folder API. Both manifest and `--no-manifest` execution preserve the same directory policy. An empty source creates the effective destination folder when a non-root path exists; `--include-parent` retains the source basename. Directory tasks count as items with zero bytes. The switch does not authorize deleting source-present directories during `sync --delete`.
+
 Use `ve-adrive-cli <command> --help` when non-connection flags are uncertain.
 
 ## Share links (V1)
@@ -376,8 +379,15 @@ ve-adrive-cli share cancel adrive://instance/share-id --yes
 The returned page URL is `/share/<ShareID>` for both files and folders. Receivers
 also accept `/share/<ShareID>/`, normalizing one trailing slash to the same share
 and checkpoint identity. Directory prefixes use `--path`, not extra URL segments. Its origin
-uses `--share-base-url` > `[profile.adrive].share_base_url` >
-`ADRIVE_SHARE_BASE_URL` > the API endpoint with the validated Instance host label.
+uses `--share-endpoint` > `[profile.adrive].share_endpoint` >
+`ADRIVE_SHARE_ENDPOINT` > the API endpoint with the validated Instance host label.
+The former CLI option, TOML key and environment variable are accepted only for
+compatibility; generate `--share-endpoint`, `share_endpoint` and
+`ADRIVE_SHARE_ENDPOINT`. The canonical environment variable wins over the old one.
+For production, `http://idsapi.volces.com`, Instance `vtagt3g9n` and ShareID
+`2T4U8z0lY1n` produce
+`http://vtagt3g9n.idsapp.volces.com/share/2T4U8z0lY1n`. An explicit page override
+is literal and does not add the Instance label.
 Public `idsapi.volces.com` / `idsapp.volces.com` and BOE
 `idsapi-boe.volces.com` / `idsapp-boe.volces.com` map automatically between API
 and page origins, retaining the Instance label, scheme and port. Share pages,
@@ -400,7 +410,10 @@ and limit is positive. Each invocation returns one page, preserving
 Update changes only supplied settings, forwarding zero, false and empty strings.
 It fetches `UpdatedAt` unless `--updated-at` is explicit. The shared target cannot
 change. Cancel uses global `--yes` in JSON, quiet or noninteractive execution;
-ordinary TTY execution asks once. Dry-run never confirms or reads password stdin.
+ordinary TTY execution asks once. Dry-run never confirms. Explicit create/update
+`--password-stdin` is read and validated even during dry-run; omitting the flag
+preserves the existing password on update. `--describe` and `--help` load no config,
+access no network and read no stdin.
 Cancellation uses API selectors and does not resolve a share-page origin. Ctrl-C
 restores terminal echo; an interruption after mutation submission requires
 reconciliation with get/list before retrying.
@@ -409,8 +422,9 @@ Use `--password-stdin` with a pipe; it reads to EOF and keeps a password out of 
 For manual macOS/Linux stdin, press Enter then Ctrl-D within 30 seconds. Enter alone
 does not close stdin. Files/download can instead use the ordinary hidden terminal
 prompt without this flag and finish with Enter. One terminal LF/CRLF is
-removed and significant spaces are preserved. The PRD does not confirm password
-clearing; do not treat empty input as a documented clearing contract.
+removed and significant spaces are preserved. Explicit EOF-only, LF-only or
+CRLF-only input fails validation (exit 6) before mutation or share-token exchange.
+The PRD does not confirm password clearing; empty input never clears a password.
 Passwords are bounded to 4096 UTF-8 bytes and reject controls
 or multiple lines. MCP's virtual `password` is write-only and piped to child stdin;
 explicit password takes precedence over a URL `pwd` query. Do not place passwords
@@ -425,34 +439,47 @@ paths. Use `--output json` for structured data. To recover a previous creation's
 ID/URL, use read-only `share list`/`share get`; do not repeat `share create` merely
 to select another output format.
 
-`share inspect` reads public info without share-token/password I/O; explicit OAuth
-can load/refresh the selected account token. `share files`
+`share inspect` reads the public share overview without share-token/password I/O;
+use `share files` for file metadata. Explicit OAuth can load/refresh the selected
+account token. `share files`
 uses exact metadata for a file `--path` and directory listing for a trailing `/`;
-no path lists share roots, including a single-file share. Preserve returned paths
-exactly. Listing returns one page with `NextMarker` and `IsTruncated`; pass
-`--marker` for another page and `--limit` for its size (service default/max 100;
-CLI accepts positive limits). Default table/CSV uses the same `file_path`, `size`,
-`file_type`, `updated_at`, `is_folder` columns and folder-first rows as `ls`, with
-stable headers even on empty pages. Table Total counts normalized display rows;
-JSON and explicit `--query` preserve the raw service arrays. Download enumerates
-pages automatically. Each
-independent call/page needs the extraction code again; passwords are never saved.
+no path lists share roots, including a single-file share. Reuse paths exactly as
+returned by the CLI. Like `ls`, listing uses `--max-keys` (default 1000) as the
+combined cap for files and folders at the current directory level. It automatically fetches
+service pages until the cap or listing end, including short internal pages.
+Pass the returned `NextMarker` unchanged through `--marker` in a later invocation
+to continue; stop when `IsTruncated=false`. `--max-keys` accepts integers from 1
+through 2147483647. `share files` has no `--limit` alias; management `share list`
+retains its existing `--limit`/`--offset` pagination. Default table/CSV uses the same
+`file_path`, `size`, `file_type`, `updated_at`, `is_folder` columns and folder-first rows as `ls`, with
+stable headers even on empty results. JSON and explicit `--query` preserve the
+`Files`, `Folders`, `NextMarker` and `IsTruncated` field names with aggregated,
+normalized current-level metadata. Directory marker entries, self entries and
+duplicates are normalized before output in all formats; Total and
+pagination.total_returned count the same logical entries. Download enumerates
+pages automatically and accepts no
+`--max-keys`, `--marker` or `--limit` flags. Each independent invocation needs the
+extraction code again; passwords are never saved.
 OAuth does not bypass password checks. Receiver password precedence is stdin > URL `pwd` >
 a hidden ordinary-TTY prompt; JSON/noninteractive execution requires stdin or URL.
 No alternate password is retried after an explicit failure.
 
 `share download <url> <destination-dir>` uses a directory destination, with
 no `--path` selecting all share roots. A single-file share automatically selects
-its file; folders require `--recursive`. Preflight may create directory scaffolding
-before a later transfer denial, leaving empty folders. Default table output shows
+its file; folders require `--recursive`. Actual downloads create directories,
+temporary files and, when requested, checkpoint and lock files; `--overwrite` replaces
+existing ordinary files only after verification. Preflight may create directory
+scaffolding before a later transfer denial, leaving empty folders. Issuing download
+URLs may consume download-count quota even if content transfer later fails. Default table output shows
 the same summary style as cp (total/succeeded/failed/skipped/pending), including
 empty results. JSON and explicit queries retain file details. Summary.Completed
 includes Summary.Skipped; the table's succeeded count excludes resumed files.
 Scanning/file-count progress uses stderr, defaults to TTY, can be forced by
 --progress, and is disabled by --no-progress or --quiet. The progress flags are
 mutually exclusive. Forced non-TTY progress uses plain lines.
-`Forbidden.ShareDownloadDisabled` is a share policy error: the share
-owner must enable `--permission download`.
+`Forbidden.ShareDownloadDisabled` may mean share permission forbids downloads or
+download-count quota is exhausted; the code alone cannot distinguish them. Ask the
+owner to check permission and quota; retain service code, HTTP status and request ID.
 Supported options are `--path`, `--recursive`, `--overwrite`, `--progress`,
 `--no-progress`, `--checkpoint-threshold <size>`, `--multipart-concurrency <n>`,
 `--checkpoint <file>`, and
@@ -484,21 +511,46 @@ Share download safety/recovery contract: enumerate at most 20,000 entries / 10,0
 pages / 64 path components / 8 MiB before issuing any signed URL. Preserve the
 selected directory basename once and empty directories. The OS resolves user-selected
 destination/checkpoint directory aliases before the CLI pins their actual roots;
-macOS `/tmp` and `/var` work without special-case rules. Native permission/type/disk
-errors are retained. Downloaded subpaths reject traversal,
+macOS `/tmp` and `/var` work without special-case rules. Intentional symlink/reparse
+descendant rejection returns Conflict (exit 9) with guidance to inspect the local
+path or choose another destination; unrelated native permission/disk/I/O errors are
+retained. Downloaded subpaths reject traversal,
 symlinks/reparse points, case/Unicode and ancestor collisions; `--overwrite`
 accepts only ordinary files. Transfer with an independent credential-free HTTP(S)
 client, no redirects, size/CRC64/strong ETag checks and local SHA-256. A signed URL
 is issued once per attempted file; bounded content retries reuse that address.
 `--resume` requires the same share origin/ID, selection, resolved destination and overwrite/
 recursive policy, rechecks remote fingerprints and completed local hashes, and
-never adds new files or resumes partial byte ranges. A checkpoint with no strong
+never adds new files or resumes partial byte ranges. Completed local size/hash
+mismatches return Conflict (exit 9), consistent with `cp`, preserving local files
+and the checkpoint. A checkpoint with no strong
 remote identity is refused. The checkpoint and lock cannot overlap mapped destinations,
 even through local directory aliases. Explicit service rejection retains its service
 code/status/category/request ID when available; download-disabled 403 exits 5 with
 permission-denied kind and `IssuanceOutcomeUnknown=false`. Do not blindly retry unknown URL issuance: quota may
 already have been consumed. The aggregate has `Complete`, `PlanComplete`,
 `CheckpointAvailable`, `IssuanceOutcomeUnknown`, `Summary` and per-file states.
+
+`share download --dry-run` uses read-only share info/token/list/get metadata and
+enumerates every selected page and recursive folder. It returns `selection.Manifest`
+with roots and remote-to-local mappings plus `PlanComplete=true`, `FileCount`,
+`DirectoryCount`, `TotalBytes`, `SkippedCount` and `Conflicts`. Missing or negative
+file sizes fail validation (exit 6); explicit zero is a valid empty file. A completed plan
+with local conflicts exits 9 and retains the plan. Resume planning reads the saved
+checkpoint and validates identities, remote metadata and completed local digests
+without locks or saves. It never issues download URLs, fetches content, creates
+directories/temporary files or writes checkpoint/lock files: `DownloadsIssued=0`,
+`LocalWrites=false`. `MetadataResponses` counts received metadata responses;
+`NetworkRequests=null` because wire attempts are not counted.
+`SnapshotGuaranteed=false` means content and local paths can change after inspection.
+OAuth dry-run disables automatic refresh to avoid credential/auth-lock writes.
+For an expired token, a token within 60 seconds of expiry, or a 401 response, first run
+`ve-adrive-cli --profile <profile> share inspect <share-url> --auth-mode oauth`
+as a normal OAuth read to refresh, then retry. Planning never acquires the
+checkpoint lock; an existing regular sidecar may be active. Execution rechecks and locks.
+Other share dry-runs remain offline, with explicit create/update password stdin
+validation as above. Describe exposes `dry_run_output_schema` separately from
+the unchanged execution `output_schema`.
 
 Shared files at least 20MB with a strong ETag or CRC64 automatically use concurrent
 16MiB Range requests; files without either use one streamed GET to avoid mixing versions.

@@ -10,6 +10,16 @@ use rustix::{
 use std::path::Path;
 use std::{fs::File, io};
 
+/// Mark an intentionally refused local entry as a conflict while preserving the native I/O interface.
+/// The marker lets share output provide destination-specific recovery guidance.
+pub(super) fn path_conflict(message: &str) -> io::Error {
+    // [Review Fix #D04] Unsafe local types are actionable destination conflicts, not unclassified I/O failures.
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("[share_local_path_conflict] {message}"),
+    )
+}
+
 /// Resolve a user-selected local directory with OS semantics, optionally creating it.
 /// Returns its canonical path or the native permission/type/I/O error; remote subpaths never use this resolver.
 pub(crate) fn resolve_directory(
@@ -64,10 +74,11 @@ impl SafeDir {
                 }
                 fs::fsync(&self.handle)?;
                 Ok(Self {
-                    handle: fs::openat(&self.handle, name, directory_flags(), Mode::empty())?,
+                    handle: fs::openat(&self.handle, name, directory_flags(), Mode::empty())
+                        .map_err(local_open_error)?,
                 })
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(local_open_error(error)),
         }
     }
     /// Resolve a validated relative directory beneath this handle, optionally creating it; reject symlinks.
@@ -102,22 +113,24 @@ impl SafeDir {
             Ok(stat) if fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::RegularFile => {
                 Ok(true)
             }
-            Ok(_) => Err(io::Error::other("destination is not an ordinary file")),
+            Ok(_) => Err(path_conflict("destination is not an ordinary file")),
             Err(rustix::io::Errno::NOENT) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
     /// Open an existing ordinary leaf without following links; return the native file or I/O error.
     pub(crate) fn read(&self, name: &str) -> io::Result<File> {
+        self.ordinary(name)?;
         let handle = fs::openat(
             &self.handle,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
-        )?;
+        )
+        .map_err(local_open_error)?;
         let file = File::from(handle);
         if !file.metadata()?.is_file() {
-            return Err(io::Error::other("not an ordinary file"));
+            return Err(path_conflict("destination is not an ordinary file"));
         }
         Ok(file)
     }
@@ -132,8 +145,8 @@ impl SafeDir {
     }
     /// Atomically publish the staged leaf with the requested overwrite policy and sync the directory; propagate I/O failures.
     pub(crate) fn replace(&self, source: &str, target: &str, is_overwrite: bool) -> io::Result<()> {
+        self.ordinary(target)?;
         if is_overwrite {
-            self.ordinary(target)?;
             fs::renameat(&self.handle, source, &self.handle, target)?;
         } else {
             fs::linkat(&self.handle, source, &self.handle, target, AtFlags::empty())?;
@@ -150,6 +163,16 @@ impl SafeDir {
 #[cfg(unix)]
 fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+#[cfg(unix)]
+fn local_open_error(error: rustix::io::Errno) -> io::Error {
+    match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+            path_conflict("destination component is a symlink or has an unexpected file type")
+        }
+        error => error.into(),
+    }
 }
 
 pub(crate) struct StagedFile {
@@ -239,6 +262,32 @@ mod tests {
         assert!(
             SafeDir::open_resolved(&resolved).is_err(),
             "re-resolving changed the root after its identity was chosen"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_destination_entries_are_conflicts_but_missing_entries_remain_io_errors() {
+        let root = fixture();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("ordinary"), b"keep").unwrap();
+        std::os::unix::fs::symlink(root.join("ordinary"), root.join("link")).unwrap();
+        let directory = SafeDir::open(&root, false).unwrap();
+        let errors = [
+            directory.ordinary("folder").unwrap_err(),
+            directory.ordinary("link").unwrap_err(),
+            directory.read("folder").unwrap_err(),
+            directory.read("link").unwrap_err(),
+            directory.directory("ordinary/child", true).err().unwrap(),
+            directory.directory("link/child", true).err().unwrap(),
+        ];
+        for error in errors {
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+            assert!(error.to_string().contains("[share_local_path_conflict]"));
+        }
+        assert_eq!(
+            directory.read("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
         std::fs::remove_dir_all(root).unwrap();
     }

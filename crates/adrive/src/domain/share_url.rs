@@ -410,6 +410,22 @@ mod tests {
     }
 
     #[test]
+    fn production_api_origin_builds_delivery_urls_with_instance_once() {
+        for scheme in ["http", "https"] {
+            for api in [
+                format!("{scheme}://idsapi.volces.com:8443"),
+                format!("{scheme}://vtagt3g9n.idsapi.volces.com:8443"),
+            ] {
+                let origin = derive_share_origin(&api, "vtagt3g9n").unwrap();
+                assert_eq!(
+                    build_share_url(&origin, "2T4U8z0lY1n").unwrap(),
+                    format!("{scheme}://vtagt3g9n.idsapp.volces.com:8443/share/2T4U8z0lY1n")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn standard_api_origins_produce_page_origins() {
         for (api, page) in [
             (

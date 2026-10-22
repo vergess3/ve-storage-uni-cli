@@ -1,5 +1,7 @@
 # Service Request ID Propagation Implementation Plan
 
+> Historical plan: the 2026-10-22 contract lowers the former 1024-ID command limit to 100 in every format and adds independent per-row report IDs. See [the follow-up plan](2026-10-22-report-request-ids.md); code examples below retain their original historical values.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make every `tos`, `ve-tos`, and `ve-adrive` command prefer sanitized service request IDs in its top-level Envelope while retaining a bounded trace for multi-request commands and a CLI ULID fallback for local work.

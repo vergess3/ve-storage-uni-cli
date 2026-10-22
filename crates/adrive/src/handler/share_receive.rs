@@ -9,7 +9,7 @@ use crate::cli::ADriveAuthArgs;
 use crate::domain::{
     client::ClientOptions,
     share_access::{ShareClient, ShareSession},
-    share_types::{GetShareAccessTokenInput, ShareLinkInfo, ShareListFilesInput},
+    share_types::{GetShareAccessTokenInput, ShareLinkInfo},
     share_url::{derive_share_api_origin, parse_share_url, ParsedShareUrl},
     types::ListFilesOutput,
 };
@@ -259,31 +259,21 @@ async fn files_value_with_auth(
     auth: &ADriveAuthArgs,
     args: &ShareFilesArgs,
 ) -> Result<Value, CliError> {
+    super::share_listing::validate_arguments(args)?;
     super::share::validate_selection(args.path.as_deref())?;
     let mut receiver = ShareReceiver::for_command(global, auth, &args.share_url)?;
     let info = receiver.info().await?;
     receiver
         .authorize(global, &info, args.is_password_stdin)
         .await?;
-    let session = receiver.ensure_session().await?;
     let mut value = if let Some(path) = args.path.as_deref().filter(|path| !path.ends_with('/')) {
+        let session = receiver.ensure_session().await?;
         json!({"Files":[session.get_file(path).await.map_err(map_ids_error)?],"Folders":[],"IsTruncated":false})
     } else {
-        serde_json::to_value(
-            session
-                .list_files(&ShareListFilesInput {
-                    prefix: args.path.clone(),
-                    delimiter: Some("/".into()),
-                    marker: args.marker.clone(),
-                    limit: args.limit,
-                    list_root: Some(args.path.is_none()),
-                })
-                .await
-                .map_err(map_ids_error)?,
-        )?
+        serde_json::to_value(super::share_listing::list_files(&mut receiver, args).await?)?
     };
     value["ShareInfo"] = serde_json::to_value(info)?;
-    value["Selection"] = json!({"Path":args.path,"Marker":args.marker,"Limit":args.limit});
+    value["Selection"] = json!({"Path":args.path,"Marker":args.marker,"MaxKeys":args.max_keys});
     Ok(receiver.safe_value(value))
 }
 /// Print basic public info without token/password I/O.
@@ -301,7 +291,7 @@ pub(crate) async fn inspect(
     )?;
     Ok(0)
 }
-/// Print one receiver page or one exact file, preserving marker pagination.
+/// Print a bounded current-level listing or one exact file, preserving its continuation marker.
 pub(crate) async fn files(
     global: &GlobalArgs,
     auth: &ADriveAuthArgs,
@@ -407,7 +397,7 @@ mod tests {
                 share_url: format!("{}/share/s", fixture.endpoint),
                 path: Some("requested".into()),
                 marker: None,
-                limit: None,
+                max_keys: 1000,
                 is_password_stdin: false,
             };
             let error = files_value(&GlobalArgs::default(), &args)
@@ -445,7 +435,7 @@ mod tests {
             share_url: format!("{}/share/requested", fixture.endpoint),
             path: None,
             marker: None,
-            limit: None,
+            max_keys: 1000,
             is_password_stdin: false,
         };
         assert!(files_value(&GlobalArgs::default(), &args).await.is_err());
@@ -476,7 +466,7 @@ mod tests {
             share_url: format!("{}/share/s?pwd=secret", fixture.endpoint),
             path: Some("a.txt".into()),
             marker: None,
-            limit: None,
+            max_keys: 1000,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -499,7 +489,7 @@ mod tests {
             share_url: format!("{}/share/s", fixture.endpoint),
             path: None,
             marker: None,
-            limit: Some(1),
+            max_keys: 1,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -523,7 +513,7 @@ mod tests {
             share_url: format!("{}/share/a?pwd=a", fixture.endpoint),
             path: Some("a.txt".into()),
             marker: None,
-            limit: None,
+            max_keys: 1000,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -539,7 +529,7 @@ mod tests {
             share_url: format!("{}/share/s", fixture.endpoint),
             path: None,
             marker: None,
-            limit: None,
+            max_keys: 1000,
             is_password_stdin: false,
         };
         let error = files_value(&GlobalArgs::default(), &args)

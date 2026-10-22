@@ -17,7 +17,8 @@ use tos_core::agent::{envelope::Envelope, error::CliError, global_args::GlobalAr
 use tos_core::infra::config::ConfigFile;
 
 /// Execute one share action with normal Envelope, query and request-trace behavior.
-/// Describe/dry-run perform no password/config/authentication I/O; receivers use OAuth only when explicitly selected.
+/// Describe performs no input I/O; download dry-run reads metadata and other plans validate explicit password stdin.
+/// Receivers use OAuth only when explicitly selected.
 pub async fn handle_share_command(
     global: &GlobalArgs,
     auth: &ADriveAuthArgs,
@@ -49,6 +50,10 @@ pub async fn handle_share_command(
     }
     validate_action(action)?;
     if global.dry_run {
+        if let ShareAction::Download(args) = action {
+            return super::share_download_plan::dry_run(global, auth, args).await;
+        }
+        validate_dry_run_password(action).await?;
         output_result(global, &Envelope::success(&command, share_plan(action)?))?;
         return Ok(0);
     }
@@ -63,6 +68,19 @@ pub async fn handle_share_command(
         return super::share_download::download(global, auth, args).await;
     }
     execute_with_interrupt(global, auth, action).await
+}
+
+async fn validate_dry_run_password(action: &ShareAction) -> Result<(), CliError> {
+    let is_password_stdin = match action {
+        ShareAction::Create(args) => args.settings.is_password_stdin,
+        ShareAction::Update(args) => args.settings.is_password_stdin,
+        _ => false,
+    };
+    if is_password_stdin {
+        // [Review Fix #D05] Validate the explicitly selected secret without exposing it in the dry-run plan.
+        super::share_password::read_password_stdin().await?;
+    }
+    Ok(())
 }
 
 async fn execute_with_interrupt(
@@ -140,7 +158,7 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
         ShareAction::Create(args) => {
             create_target(args)?;
             validate_settings(&args.settings)?;
-            validate_origin(args.share_base_url.as_deref())
+            validate_origin(args.share_endpoint.as_deref())
         }
         ShareAction::Get(args) => validate_selector(args),
         ShareAction::Cancel(args) => validate_selector(&cancel_selector(args)),
@@ -159,6 +177,7 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
             .map(|_| ())
             .map_err(map_ids_error),
         ShareAction::Files(args) => {
+            super::share_listing::validate_arguments(args)?;
             parse_share_url(&args.share_url).map_err(map_ids_error)?;
             validate_selection(args.path.as_deref())
         }
@@ -175,6 +194,9 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
         ShareAction::Download(args) => {
             parse_share_url(&args.share_url).map_err(map_ids_error)?;
             validate_selection(args.path.as_deref())?;
+            if let Some(path) = &args.path {
+                super::share_manifest::validate_relative(path.strip_suffix('/').unwrap_or(path))?;
+            }
             super::share_content::ContentRuntime::for_args(args)?;
             require_text(&args.destination_dir, "destination directory")
         }
@@ -183,7 +205,7 @@ fn validate_action(action: &ShareAction) -> Result<(), CliError> {
 
 fn validate_list(args: &ListShareArgs) -> Result<(), CliError> {
     let instance = list_instance(args)?;
-    validate_origin(args.share_base_url.as_deref())?;
+    validate_origin(args.share_endpoint.as_deref())?;
     // A placeholder creator validates all other SDK search controls without resolving identity.
     let mut input = search_input(args, instance);
     if input.creators.is_empty() {
@@ -196,14 +218,14 @@ fn list_instance(args: &ListShareArgs) -> Result<String, CliError> {
 }
 fn validate_selector(args: &ShareIdArgs) -> Result<(), CliError> {
     selector_target(args)?;
-    validate_origin(args.share_base_url.as_deref())
+    validate_origin(args.share_endpoint.as_deref())
 }
 fn selector_target(args: &ShareIdArgs) -> Result<ShareTarget, CliError> {
     resolve_share_target(&args.share_id, args.instance.as_deref()).map_err(map_ids_error)
 }
 fn validate_origin(origin: Option<&str>) -> Result<(), CliError> {
     if let Some(origin) = origin {
-        tos_core::infra::config::validate_share_base_url(origin)?;
+        tos_core::infra::config::validate_share_endpoint(origin)?;
     }
     Ok(())
 }
@@ -364,7 +386,7 @@ async fn manage_create(
     let target = create_target(&resolved)?;
     let origin = share_origin(
         global,
-        resolved.share_base_url.as_deref(),
+        resolved.share_endpoint.as_deref(),
         client.endpoint(),
         &target.instance,
     )?;
@@ -378,7 +400,7 @@ async fn manage_get(
     let selector = resolve_selector(client, args).await?;
     let origin = share_origin(
         global,
-        args.share_base_url.as_deref(),
+        args.share_endpoint.as_deref(),
         client.endpoint(),
         &selector.instance,
     )?;
@@ -392,7 +414,7 @@ async fn manage_update(
     let selector = resolve_selector(client, &args.selector).await?;
     let origin = share_origin(
         global,
-        args.selector.share_base_url.as_deref(),
+        args.selector.share_endpoint.as_deref(),
         client.endpoint(),
         &selector.instance,
     )?;
@@ -416,7 +438,7 @@ fn cancel_selector(args: &CancelShareArgs) -> ShareIdArgs {
         share_id: args.share_id.clone(),
         instance: args.instance.clone(),
         is_by_name: args.is_by_name,
-        share_base_url: None,
+        share_endpoint: None,
     }
 }
 fn clone_create(args: &CreateShareArgs) -> CreateShareArgs {
@@ -427,7 +449,7 @@ fn clone_create(args: &CreateShareArgs) -> CreateShareArgs {
         folder: args.folder.clone(),
         file: args.file.clone(),
         is_by_name: args.is_by_name,
-        share_base_url: args.share_base_url.clone(),
+        share_endpoint: args.share_endpoint.clone(),
         settings: args.settings.clone(),
     }
 }
@@ -451,8 +473,11 @@ fn share_origin(
         .profiles
         .get(&global.profile)
         .and_then(|profile| profile.adrive.as_ref())
-        .and_then(|settings| settings.share_base_url.as_deref());
-    let environment = std::env::var("ADRIVE_SHARE_BASE_URL").ok();
+        .and_then(|settings| settings.share_endpoint.as_deref());
+    // [Review Fix #ShareEndpoint3] Prefer the canonical variable while retaining old deployment configuration.
+    let environment = std::env::var("ADRIVE_SHARE_ENDPOINT")
+        .ok()
+        .or_else(|| std::env::var("ADRIVE_SHARE_BASE_URL").ok());
     // [Review Fix #ShareOrigin2] Validate after precedence so an unused invalid origin cannot block an explicit safe override.
     if let Some(origin) = explicit.or(configured).or(environment.as_deref()) {
         validate_origin(Some(origin))?;
@@ -630,7 +655,7 @@ async fn list_links(
     };
     let origin = share_origin(
         global,
-        args.share_base_url.as_deref(),
+        args.share_endpoint.as_deref(),
         client.endpoint(),
         &instance,
     )?;
@@ -833,13 +858,16 @@ fn share_plan(action: &ShareAction) -> Result<Value, CliError> {
             json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url})
         }
         ShareAction::Files(args) => {
-            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path})
+            // [Review Fix #ShareFilesPlan1] Offline plans must show and validate the same cap/cursor as execution.
+            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"MaxKeys":args.max_keys,"Marker":args.marker})
         }
         ShareAction::View(args) => {
             json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"Raw":args.is_raw,"NetworkRequests":0,"ConsumesPreviewLimit":true})
         }
-        ShareAction::Download(args) => {
-            json!({"ShareUrl":parse_share_url(&args.share_url).map_err(map_ids_error)?.safe_url,"Path":args.path,"DestinationDir":args.destination_dir,"Checkpoint":args.checkpoint,"Resume":args.is_resume,"Recursive":args.is_recursive,"Overwrite":args.is_overwrite,"PlanComplete":false,"Manifest":null,"FileCount":null,"NetworkRequests":0})
+        ShareAction::Download(_) => {
+            return Err(validation(
+                "download planning requires the read-only metadata planner",
+            ))
         }
     };
     Ok(
@@ -879,6 +907,29 @@ mod tests {
     }
     fn action(arguments: &[&str]) -> ShareAction {
         TestCli::parse_from(std::iter::once("test").chain(arguments.iter().copied())).action
+    }
+
+    #[test]
+    fn files_plan_exposes_max_keys_and_marker_with_local_validation() {
+        let selected = action(&[
+            "files",
+            "https://pages.test/share/s",
+            "--max-keys",
+            "3",
+            "--marker",
+            "next",
+        ]);
+        validate_action(&selected).unwrap();
+        let plan = share_plan(&selected).unwrap();
+        assert_eq!(plan["selection"]["MaxKeys"], 3);
+        assert_eq!(plan["selection"]["Marker"], "next");
+        let invalid = action(&[
+            "files",
+            "https://pages.test/share/s",
+            "--marker",
+            "bad\nmarker",
+        ]);
+        assert!(validate_action(&invalid).is_err());
     }
 
     #[test]
@@ -982,7 +1033,7 @@ mod tests {
             "3",
             "--limit",
             "7",
-            "--share-base-url",
+            "--share-endpoint",
             "http://pages.test",
         ]);
         action(&arguments)
@@ -1009,7 +1060,7 @@ mod tests {
                 "--by-name",
                 "--creator",
                 "u",
-                "--share-base-url",
+                "--share-endpoint",
                 "http://pages.test",
             ]),
         )
@@ -1033,7 +1084,7 @@ mod tests {
         let selected = action(&[
             "get",
             "adrive://inst/adrive%3A%2F%2Fnested%2Fs",
-            "--share-base-url",
+            "--share-endpoint",
             "http://pages.test",
         ]);
         let result = manage(
@@ -1066,7 +1117,7 @@ mod tests {
             "get",
             "adrive://My%20Instance/s",
             "--by-name",
-            "--share-base-url",
+            "--share-endpoint",
             "http://pages.test",
         ]);
         let result = manage(
@@ -1096,7 +1147,7 @@ mod tests {
             (
                 "update",
                 vec![reply(200, &observed), reply(200, &updated)],
-                vec!["--name", "New", "--share-base-url", "http://pages.test"],
+                vec!["--name", "New", "--share-endpoint", "http://pages.test"],
             ),
             ("cancel", vec![reply(204, "")], vec![]),
         ] {
@@ -1418,7 +1469,7 @@ mod tests {
             "inst",
             "--creator",
             "u",
-            "--share-base-url",
+            "--share-endpoint",
             "https://pages.test",
         ]) else {
             panic!()
@@ -1650,7 +1701,7 @@ mod tests {
             std::env::temp_dir().join(format!("share-origin-review-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&directory).unwrap();
         let config_path = directory.join("config.toml");
-        std::fs::write(&config_path,format!("[default.adrive]\nregion='cn-beijing'\nendpoint='{endpoint}'\naccess_key_id='fixture-ak'\nsecret_access_key='fixture-sk'\nshare_base_url='https://user:must-not-echo@bad.test'\n")).unwrap();
+        std::fs::write(&config_path,format!("[default.adrive]\nregion='cn-beijing'\nendpoint='{endpoint}'\naccess_key_id='fixture-ak'\nsecret_access_key='fixture-sk'\nshare_endpoint='https://user:must-not-echo@bad.test'\n")).unwrap();
         (
             GlobalArgs {
                 config_path: Some(config_path),
@@ -1663,12 +1714,15 @@ mod tests {
     #[test]
     fn configured_http_api_needs_no_share_page_override() {
         // [Review Fix #ShareHttpOrigin2] Isolate inherited page overrides in a child process without mutating other tests' environment.
-        if std::env::var_os("ADRIVE_SHARE_BASE_URL").is_some() {
+        if std::env::var_os("ADRIVE_SHARE_ENDPOINT").is_some()
+            || std::env::var_os("ADRIVE_SHARE_BASE_URL").is_some()
+        {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "handler::share::tests::configured_http_api_needs_no_share_page_override",
                 ])
+                .env_remove("ADRIVE_SHARE_ENDPOINT")
                 .env_remove("ADRIVE_SHARE_BASE_URL")
                 .output()
                 .unwrap();
@@ -1709,7 +1763,7 @@ mod tests {
         let args = action(&[
             "create",
             "adrive://inst/space/a",
-            "--share-base-url",
+            "--share-endpoint",
             "https://good.test",
         ]);
         let result = manage(
@@ -1763,7 +1817,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("share_base_url"));
+        assert!(error.to_string().contains("share_endpoint"));
         assert!(!error.to_string().contains("must-not-echo"));
         assert!(fixture.requests.lock().unwrap().is_empty());
         std::fs::remove_dir_all(directory).unwrap();

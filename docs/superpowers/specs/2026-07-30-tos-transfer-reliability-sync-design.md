@@ -149,8 +149,10 @@ Only the HTTP transport boundary encodes the key:
 - literal percent signs become `%25`;
 - query strings continue to use their existing independent encoder.
 
-ByteTOS V1 signs the same encoded path that is placed on the wire. TOS4
-continues to canonicalize the raw logical path once, avoiding double encoding.
+Correction verified on 2026-10-21: ByteTOS V1 signs the raw logical path,
+matching the Go SDK's `URL.Path`; only the HTTP URL carries the escaped path.
+PSM host resolution preserves that escaped URL path separately from signing.
+TOS4 continues to canonicalize the raw logical path once, avoiding double encoding.
 ASCII unreserved keys therefore produce the same URL and signature as before.
 
 ## Error Handling

@@ -105,7 +105,7 @@ ve-adrive-cli share download https://instance.example.test/share/share-id ./down
 
 1. Confirm the exact file or folder scope before create; use `--dry-run` to inspect
    selectors without acquiring or displaying secrets. Supply a safe page origin
-   with `config set share_base_url https://pages.example.test` when derivation is
+   with `config set share_endpoint https://pages.example.test` when derivation is
    inappropriate. `config show` reports its source.
    Standard public/BOE `idsapi` and `idsapp` hosts under `volces.com` map
    automatically, preserving Instance, scheme and port. Custom receiver APIs use explicit

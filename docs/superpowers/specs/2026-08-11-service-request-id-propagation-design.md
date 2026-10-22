@@ -50,12 +50,19 @@ this contract:
   IDs in completion order;
 - aggregate commands covered by this contract return an object-shaped `data`
   payload so the trace fields have one stable location;
-- the list is bounded to 1024 entries, matching the existing `du` diagnostic
-  limit;
+- the list is bounded to 100 entries in all output formats, matching the `du`
+  diagnostic limit (updated by the 2026-10-22 report request-ID contract);
 - `data.service_request_ids_omitted` reports how many additional IDs were not
   retained;
 - duplicate IDs are retained because each position represents an observed
   response and the CLI must not assume service-side uniqueness.
+
+Execution report CSV rows append a `request_id` column independently of this
+command-level bound. Both successful and failed rows retain their own terminal
+service response ID when available, with an empty cell for no usable response ID.
+Concurrent operations must not read a command-wide or process-wide last ID to
+populate a file row. Failure cleanup does not overwrite the original failed
+operation's ID.
 
 Retry responses that contain a service request ID are recorded even when a
 later attempt succeeds. Connection failures that never receive an HTTP
@@ -98,7 +105,7 @@ multi-request commands. It provides:
 - the last successfully recorded ID;
 - terminal-attempt metadata so an error caused by a response keeps that
   response's ID, while a terminal transport failure keeps the CLI fallback;
-- at most 1024 retained IDs;
+- at most 100 retained IDs;
 - an omitted counter;
 - a snapshot suitable for attaching to JSON payloads and Envelopes.
 
@@ -163,11 +170,11 @@ Implementation is complete only when automated tests demonstrate:
 2. one ADrive response honors `x-ids-request-id` before `x-request-id`;
 3. `tos ls tos://...` no longer discards parsed response metadata;
 4. every `ve-adrive ls` scope places its service ID at the top level;
-5. multi-page listing uses the last successful page ID and emits all observed
-   IDs in `data.service_request_ids`;
+5. multi-page listing uses the last successful page ID and emits retained
+   observed IDs in `data.service_request_ids`, subject to the 100-entry bound;
 6. retryable responses contribute IDs and a later success becomes the top-level
    ID;
-7. the 1024-entry limit and omitted counter are enforced;
+7. the 100-entry limit and omitted counter are enforced;
 8. failed service responses preserve their terminal service request ID;
 9. local commands and responses without a request ID still receive a ULID;
 10. explicit `null` remains unchanged;

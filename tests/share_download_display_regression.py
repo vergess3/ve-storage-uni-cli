@@ -117,7 +117,7 @@ def check_denial(binary, root, origin):
     assert envelope["data"]["Summary"] == {"Total": 41, "Completed": 0, "Failed": 1, "Pending": 40, "Skipped": 0}
     assert "share owner" in envelope["error"]["suggested_action"] and "--permission download" in envelope["error"]["suggested_action"]
     assert "refresh credentials" not in envelope["error"]["suggested_action"]
-    assert "download is disabled" in envelope["error"]["message"]
+    assert "permission" in envelope["error"]["message"] and "quota" in envelope["error"]["message"]
     selected, _destination = invoke(binary, root, origin, "denied", ("table", "data.Files[].{name:Path,result:Status}"))
     assert "name" in selected.stdout and "result" in selected.stdout and "data.Summary" not in selected.stdout
 

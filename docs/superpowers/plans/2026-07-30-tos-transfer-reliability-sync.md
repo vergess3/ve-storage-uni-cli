@@ -1,5 +1,7 @@
 # TOS Transfer Reliability and Sync Optimization Implementation Plan
 
+> Correction (2026-10-21): the V1 encoded-signing-path expectation recorded in this historical plan was incorrect. ByteTOS V1 signs the raw logical path, while its HTTP URL is escaped once. Current evidence and regression commands are recorded in [the follow-up verification](../../tos-transfer-regressions-verification.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Fix replayable upload retries, async SHA256, unsupported automatic CRC64, object-key encoding, and recursive sync concurrency/HEAD bottlenecks without changing existing CLI contracts.

@@ -18,7 +18,7 @@ use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecD
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Read as IoRead, SeekFrom, Write as IoWrite};
+use std::io::{BufRead, BufReader, Read as IoRead, SeekFrom, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
@@ -42,6 +42,10 @@ use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
+use tos_core::agent::request_id::{
+    capture_service_request_id, current_service_request_id, has_operation_request_scope,
+    sanitize_request_id, without_operation_request_tracking, SERVICE_REQUEST_ID_LIMIT,
+};
 use tos_core::infra::auth::hash_payload;
 use tos_core::infra::client::TosClient;
 use tos_core::infra::config::{
@@ -64,6 +68,18 @@ use crate::handler::common::{
 };
 use crate::registry::{describe_command_metadata, enforce_registry_guards};
 
+#[cfg(test)]
+#[path = "high_level_report_request_id_tests.rs"]
+mod report_request_id_tests;
+
+#[path = "directory_upload.rs"]
+mod directory_upload;
+use directory_upload::*;
+
+#[cfg(test)]
+#[path = "directory_upload_tests.rs"]
+mod directory_upload_tests;
+
 /// Default columns for `ve-tos ls` table/csv view when listing objects.
 const LS_OBJECT_TABLE_COLUMNS: &[&str] = &[
     "entry_type",
@@ -74,7 +90,8 @@ const LS_OBJECT_TABLE_COLUMNS: &[&str] = &[
 ];
 // [Review Fix #1] Keep verbose du diagnostics bounded on buckets with massive cardinality.
 const DU_CATEGORY_BUCKET_LIMIT: usize = 1024;
-const DU_REQUEST_ID_LIMIT: usize = 1024;
+// [Review Fix #21] DU diagnostics follow the same bound as other command envelopes.
+const DU_REQUEST_ID_LIMIT: usize = SERVICE_REQUEST_ID_LIMIT;
 const DU_OVERFLOW_BUCKET: &str = "(other)";
 const DEFAULT_BATCH_FILE_ROLLOVER_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_PROGRESS_LABEL_WIDTH: usize = 60;
@@ -202,12 +219,59 @@ struct BatchSummary {
     skipped: u64,
 }
 
-type TosDeleteFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<(), CliError>)> + 'a>>;
-type TosObjectActionFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<(), CliError>)> + 'a>>;
+type TosDeleteFuture<'a> = Pin<Box<dyn Future<Output = (String, ReportedResult<()>)> + 'a>>;
+type TosObjectActionFuture<'a> = Pin<Box<dyn Future<Output = (String, ReportedResult<()>)> + 'a>>;
 type TosCopyFuture<'a> =
-    Pin<Box<dyn Future<Output = (String, String, u64, Result<CopyTransferResult, CliError>)> + 'a>>;
+    Pin<Box<dyn Future<Output = (String, String, u64, ReportedResult<CopyTransferResult>)> + 'a>>;
 type TosMoveFuture<'a> =
-    Pin<Box<dyn Future<Output = (TransferPlanItem, Result<CopyTransferResult, CliError>)> + 'a>>;
+    Pin<Box<dyn Future<Output = (TransferPlanItem, ReportedResult<CopyTransferResult>)> + 'a>>;
+
+struct ReportedResult<T> {
+    result: Result<T, CliError>,
+    request_id: Option<String>,
+    is_captured: bool,
+}
+
+impl<T> From<Result<T, CliError>> for ReportedResult<T> {
+    fn from(result: Result<T, CliError>) -> Self {
+        let is_captured = scoped_report_request_id().is_some();
+        Self {
+            result,
+            request_id: report_request_id(),
+            is_captured,
+        }
+    }
+}
+
+impl<T> ReportedResult<T> {
+    fn record<R>(self, record: impl FnOnce(Result<T, CliError>) -> R) -> R {
+        if self.is_captured {
+            with_report_request_id(self.request_id, || record(self.result))
+        } else {
+            record(self.result)
+        }
+    }
+
+    fn map<U>(self, transform: impl FnOnce(T) -> U) -> ReportedResult<U> {
+        ReportedResult {
+            result: self.result.map(transform),
+            request_id: self.request_id,
+            is_captured: self.is_captured,
+        }
+    }
+}
+
+async fn capture_report_result<T>(
+    operation: impl Future<Output = Result<T, CliError>>,
+) -> ReportedResult<T> {
+    // [Review Fix #21] Carry IDs beside errors too, including local decode/write failures.
+    let (result, request_id) = capture_service_request_id(operation).await;
+    ReportedResult {
+        result,
+        request_id,
+        is_captured: true,
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct BatchItemResult {
@@ -223,6 +287,8 @@ struct BatchItemResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 impl BatchReport {
@@ -289,6 +355,25 @@ impl BatchReport {
         self.record_item(BatchItemResult::skipped(operation, source, destination));
     }
 
+    fn record_copy_result(
+        &mut self,
+        operation: &str,
+        source: &str,
+        destination: &str,
+        result: &CopyTransferResult,
+    ) {
+        // [Review Fix #21] A batch completion must retain its own service response ID.
+        let request_id = scoped_report_request_id()
+            .unwrap_or_else(|| result.request_id.as_deref().and_then(sanitize_request_id));
+        with_report_request_id(request_id, || {
+            if result.is_skipped() {
+                self.record_skipped(operation, source, Some(destination));
+            } else {
+                self.record_success(operation, source, Some(destination));
+            }
+        });
+    }
+
     fn record_item(&mut self, item: BatchItemResult) {
         if let Some(sink) = self.streaming_sink.as_mut() {
             sink.write_item(&item);
@@ -345,6 +430,9 @@ impl BatchItemResult {
             error_code: err.map(|err| err.exit_code().as_i32()),
             message: err.map(ToString::to_string),
             retryable: err.map(is_retryable_error).unwrap_or(false),
+            request_id: err
+                .map(report_error_request_id)
+                .unwrap_or_else(report_request_id),
         }
     }
 }
@@ -622,6 +710,7 @@ struct TosRecursiveListOptions {
 // observability does not keep expanding already complex function signatures.
 struct RecursiveMappingOptions<'a> {
     include_parent: bool,
+    directory_upload_policy: Option<DirectoryUploadPolicy>,
     recursive_list_mode: Option<RecursiveListMode>,
     list_concurrency: usize,
     scan_progress: Option<&'a mut RemoteScanProgress>,
@@ -2462,18 +2551,21 @@ async fn queue_tos_stream_delete<'a>(
     let uri = format!("tos://{}/{}", target.bucket, key);
     let bucket = target.bucket.clone();
     in_flight.push(Box::pin(async move {
-        let result = core::execute_object_request(
-            client,
-            "ve-tos rm recursive",
-            Method::DELETE,
-            &bucket,
-            &key,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            None,
-        )
-        .await
-        .map(|_| ());
+        let result = capture_report_result(async {
+            core::execute_object_request(
+                client,
+                "ve-tos rm recursive",
+                Method::DELETE,
+                &bucket,
+                &key,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
+        .await;
         (uri, result)
     }));
     Ok(())
@@ -2606,16 +2698,19 @@ async fn delete_tos_key_group(
             let uri = format!("tos://{}/{}", bucket, key);
             let bucket = bucket.to_string();
             in_flight.push(async move {
-                let result = core::execute_object_request(
-                    client,
-                    "ve-tos rm recursive",
-                    Method::DELETE,
-                    &bucket,
-                    &key,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    None,
-                )
+                let result = capture_report_result(async {
+                    core::execute_object_request(
+                        client,
+                        "ve-tos rm recursive",
+                        Method::DELETE,
+                        &bucket,
+                        &key,
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        None,
+                    )
+                    .await
+                })
                 .await;
                 (uri, result)
             });
@@ -2642,28 +2737,30 @@ fn record_tos_key_delete_result(
     report_failures_only: bool,
     report: &mut BatchReport,
     uri: String,
-    result: Result<(), CliError>,
+    result: impl Into<ReportedResult<()>>,
 ) -> Result<(), CliError> {
-    if let Some(progress) = progress {
-        progress.inc(1);
-    }
-    match result {
-        Ok(()) => {
-            write_single_report(
-                success_report_path(report_path, report_failures_only),
-                "delete",
-                &uri,
-                None,
-                "succeeded",
-            )?;
-            report.record_success("delete", &uri, None);
+    result.into().record(|result| {
+        if let Some(progress) = progress {
+            progress.inc(1);
         }
-        Err(err) => {
-            write_error_report(report_path, "delete", &uri, None, &err)?;
-            report.record_failure("delete", &uri, None, &err);
+        match result {
+            Ok(()) => {
+                write_single_report(
+                    success_report_path(report_path, report_failures_only),
+                    "delete",
+                    &uri,
+                    None,
+                    "succeeded",
+                )?;
+                report.record_success("delete", &uri, None);
+            }
+            Err(err) => {
+                write_error_report(report_path, "delete", &uri, None, &err)?;
+                report.record_failure("delete", &uri, None, &err);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 async fn stream_delete_tos_hierarchical_pages(
@@ -2773,28 +2870,30 @@ fn record_tos_stream_delete_result(
     report_failures_only: bool,
     report: &mut BatchReport,
     uri: String,
-    result: Result<(), CliError>,
+    result: impl Into<ReportedResult<()>>,
 ) -> Result<(), CliError> {
-    if let Some(progress) = progress {
-        progress.inc(1);
-    }
-    match result {
-        Ok(()) => {
-            write_single_report(
-                success_report_path(report_path, report_failures_only),
-                "delete",
-                &uri,
-                None,
-                "succeeded",
-            )?;
-            report.record_success("delete", &uri, None);
+    result.into().record(|result| {
+        if let Some(progress) = progress {
+            progress.inc(1);
         }
-        Err(err) => {
-            write_error_report(report_path, "delete", &uri, None, &err)?;
-            report.record_failure("delete", &uri, None, &err);
+        match result {
+            Ok(()) => {
+                write_single_report(
+                    success_report_path(report_path, report_failures_only),
+                    "delete",
+                    &uri,
+                    None,
+                    "succeeded",
+                )?;
+                report.record_success("delete", &uri, None);
+            }
+            Err(err) => {
+                write_error_report(report_path, "delete", &uri, None, &err)?;
+                report.record_failure("delete", &uri, None, &err);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 async fn abort_multipart_uploads_for_rm(
@@ -2834,39 +2933,45 @@ async fn abort_multipart_uploads_for_rm(
             upload.upload_id
         );
         let query = multipart_upload_id_query(&upload.upload_id);
-        match core::execute_object_request(
-            client,
-            "ve-tos rm abort-upload",
-            Method::DELETE,
-            &target.bucket,
-            &upload.key,
-            query,
-            BTreeMap::new(),
-            None,
-        )
+        capture_report_result(async {
+            core::execute_object_request(
+                client,
+                "ve-tos rm abort-upload",
+                Method::DELETE,
+                &target.bucket,
+                &upload.key,
+                query,
+                BTreeMap::new(),
+                None,
+            )
+            .await
+        })
         .await
-        {
-            Ok(_) => {
-                if let Some(progress) = &upload_bar {
-                    progress.inc(1);
+        .record(|result| -> Result<(), CliError> {
+            match result {
+                Ok(_) => {
+                    if let Some(progress) = &upload_bar {
+                        progress.inc(1);
+                    }
+                    write_single_report(
+                        success_report_path(report_path, report_failures_only),
+                        "abort-upload",
+                        &uri,
+                        None,
+                        "succeeded",
+                    )?;
+                    report.record_success("abort-upload", &uri, None);
                 }
-                write_single_report(
-                    success_report_path(report_path, report_failures_only),
-                    "abort-upload",
-                    &uri,
-                    None,
-                    "succeeded",
-                )?;
-                report.record_success("abort-upload", &uri, None);
-            }
-            Err(err) => {
-                if let Some(progress) = &upload_bar {
-                    progress.inc(1);
+                Err(err) => {
+                    if let Some(progress) = &upload_bar {
+                        progress.inc(1);
+                    }
+                    write_error_report(report_path, "abort-upload", &uri, None, &err)?;
+                    report.record_failure("abort-upload", &uri, None, &err);
                 }
-                write_error_report(report_path, "abort-upload", &uri, None, &err)?;
-                report.record_failure("abort-upload", &uri, None, &err);
             }
-        }
+            Ok(())
+        })?;
     }
     if let Some(progress) = upload_bar {
         progress.finish();
@@ -2907,7 +3012,12 @@ async fn execute_rm_hns_direct(
     )
     .await?;
     let mut report = BatchReport::new(1);
-    report.record_success("delete", path, None);
+    with_report_request_id(
+        result.request_id.as_deref().and_then(sanitize_request_id),
+        || {
+            report.record_success("delete", path, None);
+        },
+    );
     write_tos_batch_report(
         report_path.as_deref(),
         "ve-tos rm",
@@ -3034,18 +3144,21 @@ async fn delete_tos_version_group(
             in_flight.push(async move {
                 let mut query = BTreeMap::new();
                 query.insert("versionId".to_string(), version.version_id.clone());
-                let result = core::execute_object_request(
-                    client,
-                    "ve-tos rm all-versions",
-                    Method::DELETE,
-                    bucket,
-                    &version.key,
-                    query,
-                    BTreeMap::new(),
-                    None,
-                )
-                .await
-                .map(|_| ());
+                let result = capture_report_result(async {
+                    core::execute_object_request(
+                        client,
+                        "ve-tos rm all-versions",
+                        Method::DELETE,
+                        bucket,
+                        &version.key,
+                        query,
+                        BTreeMap::new(),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                })
+                .await;
                 (uri, result)
             });
         }
@@ -3055,22 +3168,25 @@ async fn delete_tos_version_group(
         if let Some(progress) = progress {
             progress.inc(1);
         }
-        match result {
-            Ok(()) => {
-                write_single_report(
-                    success_report_path(report_path, report_failures_only),
-                    "delete",
-                    &uri,
-                    None,
-                    "succeeded",
-                )?;
-                report.record_success("delete", &uri, None);
+        result.record(|result| -> Result<(), CliError> {
+            match result {
+                Ok(()) => {
+                    write_single_report(
+                        success_report_path(report_path, report_failures_only),
+                        "delete",
+                        &uri,
+                        None,
+                        "succeeded",
+                    )?;
+                    report.record_success("delete", &uri, None);
+                }
+                Err(err) => {
+                    write_error_report(report_path, "delete", &uri, None, &err)?;
+                    report.record_failure("delete", &uri, None, &err);
+                }
             }
-            Err(err) => {
-                write_error_report(report_path, "delete", &uri, None, &err)?;
-                report.record_failure("delete", &uri, None, &err);
-            }
-        }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -3225,14 +3341,17 @@ async fn execute_restore(
                 }
                 let bucket = target.bucket.clone();
                 in_flight.push(async move {
-                    let result = restore_one_object(
-                        client,
-                        &bucket,
-                        &item.key,
-                        args.days,
-                        args.tier.as_deref(),
-                        args.version_id.as_deref(),
-                    )
+                    let result = capture_report_result(async {
+                        restore_one_object(
+                            client,
+                            &bucket,
+                            &item.key,
+                            args.days,
+                            args.tier.as_deref(),
+                            args.version_id.as_deref(),
+                        )
+                        .await
+                    })
                     .await;
                     (uri, result)
                 });
@@ -3241,28 +3360,31 @@ async fn execute_restore(
             let Some((uri, result)) = in_flight.next().await else {
                 break;
             };
-            match result {
-                Ok(_) => {
-                    if let Some(b) = &bar {
-                        b.inc(1);
+            result.record(|result| -> Result<(), CliError> {
+                match result {
+                    Ok(_) => {
+                        if let Some(b) = &bar {
+                            b.inc(1);
+                        }
+                        write_single_report(
+                            success_report_path(report_path.as_deref(), args.report_failures_only),
+                            "restore",
+                            &uri,
+                            None,
+                            "succeeded",
+                        )?;
+                        report.record_success("restore", &uri, None);
                     }
-                    write_single_report(
-                        success_report_path(report_path.as_deref(), args.report_failures_only),
-                        "restore",
-                        &uri,
-                        None,
-                        "succeeded",
-                    )?;
-                    report.record_success("restore", &uri, None);
-                }
-                Err(err) => {
-                    if let Some(b) = &bar {
-                        b.inc(1);
+                    Err(err) => {
+                        if let Some(b) = &bar {
+                            b.inc(1);
+                        }
+                        write_error_report(report_path.as_deref(), "restore", &uri, None, &err)?;
+                        report.record_failure("restore", &uri, None, &err);
                     }
-                    write_error_report(report_path.as_deref(), "restore", &uri, None, &err)?;
-                    report.record_failure("restore", &uri, None, &err);
                 }
-            }
+                Ok(())
+            })?;
         }
         if let Some(b) = bar {
             b.finish();
@@ -3632,16 +3754,19 @@ async fn queue_tos_stream_restore<'a>(
     let tier = args.tier.clone();
     let version_id = args.version_id.clone();
     in_flight.push(Box::pin(async move {
-        let result = restore_one_object(
-            client,
-            &bucket,
-            &key,
-            days,
-            tier.as_deref(),
-            version_id.as_deref(),
-        )
-        .await
-        .map(|_| ());
+        let result = capture_report_result(async {
+            restore_one_object(
+                client,
+                &bucket,
+                &key,
+                days,
+                tier.as_deref(),
+                version_id.as_deref(),
+            )
+            .await
+            .map(|_| ())
+        })
+        .await;
         (uri, result)
     }));
     Ok(())
@@ -3653,28 +3778,30 @@ fn record_tos_stream_restore_result(
     report_failures_only: bool,
     report: &mut BatchReport,
     uri: String,
-    result: Result<(), CliError>,
+    result: impl Into<ReportedResult<()>>,
 ) -> Result<(), CliError> {
-    if let Some(progress) = progress {
-        progress.inc(1);
-    }
-    match result {
-        Ok(()) => {
-            write_single_report(
-                success_report_path(report_path, report_failures_only),
-                "restore",
-                &uri,
-                None,
-                "succeeded",
-            )?;
-            report.record_success("restore", &uri, None);
+    result.into().record(|result| {
+        if let Some(progress) = progress {
+            progress.inc(1);
         }
-        Err(err) => {
-            write_error_report(report_path, "restore", &uri, None, &err)?;
-            report.record_failure("restore", &uri, None, &err);
+        match result {
+            Ok(()) => {
+                write_single_report(
+                    success_report_path(report_path, report_failures_only),
+                    "restore",
+                    &uri,
+                    None,
+                    "succeeded",
+                )?;
+                report.record_success("restore", &uri, None);
+            }
+            Err(err) => {
+                write_error_report(report_path, "restore", &uri, None, &err)?;
+                report.record_failure("restore", &uri, None, &err);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn record_tos_restore_skipped(
@@ -3907,6 +4034,7 @@ async fn execute_mv_recursive_tos(
         &args.destination,
         RecursiveMappingOptions {
             include_parent: args.include_parent,
+            directory_upload_policy: None,
             recursive_list_mode: args.recursive_list_mode,
             list_concurrency: runtime.list_concurrency,
             scan_progress: Some(&mut scan_progress),
@@ -3994,22 +4122,25 @@ async fn execute_mv_recursive_tos(
             let write_options = write_options.clone();
 
             in_flight.push(async move {
-                let result = copy_one(
-                    global,
-                    client,
-                    &source,
-                    &destination,
-                    runtime.copy_options(
-                        None,
-                        false,
-                        true,
-                        checkpoint_dir,
-                        write_options,
-                        progress_enabled,
-                        true,
-                        overall_bar_ref,
-                    ),
-                )
+                let result = capture_report_result(async {
+                    copy_one(
+                        global,
+                        client,
+                        &source,
+                        &destination,
+                        runtime.copy_options(
+                            None,
+                            false,
+                            true,
+                            checkpoint_dir,
+                            write_options,
+                            progress_enabled,
+                            true,
+                            overall_bar_ref,
+                        ),
+                    )
+                    .await
+                })
                 .await;
                 (source, destination, bytes, result)
             });
@@ -4178,19 +4309,22 @@ async fn execute_tos_hns_recursive_rename(
         args.report_failures_only,
         Some(&manifest),
     )?;
-    let rename_result = core::execute_object_request(
-        client,
-        "ve-tos mv recursive rename",
-        Method::PUT,
-        &plan.bucket,
-        &plan.source_key,
-        tos_recursive_rename_query(&plan),
-        tos_recursive_rename_headers(),
-        None,
-    )
+    let rename_result = capture_report_result(async {
+        core::execute_object_request(
+            client,
+            "ve-tos mv recursive rename",
+            Method::PUT,
+            &plan.bucket,
+            &plan.source_key,
+            tos_recursive_rename_query(&plan),
+            tos_recursive_rename_headers(),
+            None,
+        )
+        .await
+    })
     .await;
 
-    match rename_result {
+    rename_result.record(|rename_result| match rename_result {
         Ok(result) => finish_tos_recursive_rename_success(
             global,
             args,
@@ -4209,7 +4343,7 @@ async fn execute_tos_hns_recursive_rename(
             &mut report,
             &err,
         ),
-    }
+    })
 }
 
 fn finish_tos_recursive_rename_success(
@@ -4453,22 +4587,25 @@ impl<'a> TosStreamMoveContext<'a> {
         self.in_flight.push(Box::pin(async move {
             let source = item.source.clone();
             let destination = item.destination.clone();
-            let copy_result = copy_one(
-                global,
-                client,
-                &source,
-                &destination,
-                runtime.copy_options(
-                    None,
-                    false,
-                    true,
-                    checkpoint_dir,
-                    write_options,
-                    false,
-                    true,
-                    None,
-                ),
-            )
+            let copy_result = capture_report_result(async {
+                copy_one(
+                    global,
+                    client,
+                    &source,
+                    &destination,
+                    runtime.copy_options(
+                        None,
+                        false,
+                        true,
+                        checkpoint_dir,
+                        write_options,
+                        false,
+                        true,
+                        None,
+                    ),
+                )
+                .await
+            })
             .await;
             (item, copy_result)
         }));
@@ -4488,7 +4625,7 @@ impl<'a> TosStreamMoveContext<'a> {
             return true;
         }
         let delete_result = if should_delete && !self.report.reporting_failed() {
-            Some(delete_move_source_item(self.client, &item).await)
+            Some(capture_report_result(delete_move_source_item(self.client, &item)).await)
         } else {
             None
         };
@@ -4719,36 +4856,38 @@ fn record_tos_stream_move_copy_result(
     progress: &Option<ProgressBar>,
     report: &mut BatchReport,
     item: &TransferPlanItem,
-    copy_result: Result<CopyTransferResult, CliError>,
+    copy_result: impl Into<ReportedResult<CopyTransferResult>>,
 ) -> bool {
-    if let Some(progress) = progress {
-        progress.inc(1);
-    }
-    match copy_result {
-        Ok(result) if result.is_skipped() => {
-            report.record_skipped("copy", &item.source, Some(&item.destination));
-            true
+    copy_result.into().record(|copy_result| {
+        if let Some(progress) = progress {
+            progress.inc(1);
         }
-        Ok(_) => {
-            report.record_success("copy", &item.source, Some(&item.destination));
-            true
+        match copy_result {
+            Ok(result) if result.is_skipped() => {
+                report.record_copy_result("copy", &item.source, &item.destination, &result);
+                true
+            }
+            Ok(result) => {
+                report.record_copy_result("copy", &item.source, &item.destination, &result);
+                true
+            }
+            Err(ref err) => {
+                report.record_failure("copy", &item.source, Some(&item.destination), err);
+                eprintln!(
+                    "warn: mv copy failed source={} destination={} error={}",
+                    item.source, item.destination, err
+                );
+                false
+            }
         }
-        Err(ref err) => {
-            report.record_failure("copy", &item.source, Some(&item.destination), err);
-            eprintln!(
-                "warn: mv copy failed source={} destination={} error={}",
-                item.source, item.destination, err
-            );
-            false
-        }
-    }
+    })
 }
 
 fn record_tos_stream_move_delete_result(
     progress: &Option<ProgressBar>,
     report: &mut BatchReport,
     item: &TransferPlanItem,
-    delete_result: Option<Result<(), CliError>>,
+    delete_result: Option<ReportedResult<()>>,
 ) {
     record_tos_stream_move_delete_action(progress, report, &item.source, delete_result);
 }
@@ -4757,15 +4896,18 @@ fn record_tos_stream_move_delete_action(
     progress: &Option<ProgressBar>,
     report: &mut BatchReport,
     source: &str,
-    delete_result: Option<Result<(), CliError>>,
+    delete_result: Option<ReportedResult<()>>,
 ) {
-    match delete_result {
-        Some(Ok(())) => report.record_success("delete-source", source, None),
-        Some(Err(ref err)) => {
-            report.record_failure("delete-source", source, None, err);
-            eprintln!("warn: failed to delete source {}: {}", source, err);
-        }
-        None => report.record_skipped("delete-source", source, None),
+    if let Some(result) = delete_result {
+        result.record(|result| match result {
+            Ok(()) => report.record_success("delete-source", source, None),
+            Err(ref err) => {
+                report.record_failure("delete-source", source, None, err);
+                eprintln!("warn: failed to delete source {}: {}", source, err);
+            }
+        });
+    } else {
+        report.record_skipped("delete-source", source, None);
     }
     if let Some(progress) = progress {
         progress.inc(1);
@@ -4794,11 +4936,13 @@ async fn finish_unmanifested_hns_move_directories(
     for (item, copy_succeeded) in deferred_directory_deletes {
         let delete_result = if can_delete_directory && copy_succeeded && !report.reporting_failed()
         {
-            Some(delete_move_source_item(client, &item).await)
+            Some(capture_report_result(delete_move_source_item(client, &item)).await)
         } else {
             None
         };
-        let delete_failed = delete_result.as_ref().is_some_and(Result::is_err);
+        let delete_failed = delete_result
+            .as_ref()
+            .is_some_and(|result| result.result.is_err());
         record_tos_stream_move_delete_result(progress, report, &item, delete_result);
         if delete_failed || report.reporting_failed() {
             can_delete_directory = false;
@@ -4819,9 +4963,12 @@ async fn finish_unmanifested_hns_move_directories(
         && !report.reporting_failed()
     {
         Some(
-            delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None)
-                .await
-                .map(|_| ()),
+            capture_report_result(async {
+                delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None)
+                    .await
+                    .map(|_| ())
+            })
+            .await,
         )
     } else {
         None
@@ -4919,10 +5066,10 @@ fn execute_mv_recursive_local(
         ) {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
-                    report.record_success("copy", &item.source, Some(&item.destination));
+                    report.record_copy_result("copy", &item.source, &item.destination, &result);
                 }
                 CopyOutcome::Skipped => {
-                    report.record_skipped("copy", &item.source, Some(&item.destination));
+                    report.record_copy_result("copy", &item.source, &item.destination, &result);
                 }
             },
             Err(err) => {
@@ -4982,6 +5129,7 @@ fn cp_args_from_mv(args: &MvArgs, checkpoint: bool, report_path: Option<String>)
         destination: args.destination.clone(),
         recursive: true,
         include_parent: args.include_parent,
+        disable_dir_object: true,
         include: args.include.clone(),
         exclude: args.exclude.clone(),
         checkpoint,
@@ -5018,29 +5166,32 @@ fn record_tos_copy_result(
     source: String,
     destination: String,
     bytes: u64,
-    result: Result<CopyTransferResult, CliError>,
+    result: impl Into<ReportedResult<CopyTransferResult>>,
 ) {
-    match result {
-        Ok(result) => match result.outcome {
-            CopyOutcome::Transferred => {
-                summary.record_success(bytes);
-                report.record_success(operation, &source, Some(&destination));
+    result.into().record(|result| {
+        match result {
+            Ok(result) => match result.outcome {
+                CopyOutcome::Transferred => {
+                    summary.record_success(bytes);
+                    report.record_copy_result(operation, &source, &destination, &result);
+                }
+                CopyOutcome::Skipped => {
+                    summary.record_skip();
+                    // [Review Fix #Directory-Progress] Empty directory skips still consume one planned unit.
+                    summary.add_bytes(directory_progress_bytes(&source, &destination, bytes));
+                    report.record_copy_result(operation, &source, &destination, &result);
+                }
+            },
+            Err(ref err) => {
+                summary.record_failure(bytes);
+                report.record_failure(operation, &source, Some(&destination), err);
+                eprintln!(
+                    "warn: copy failed source={} destination={} error={}",
+                    source, destination, err
+                );
             }
-            CopyOutcome::Skipped => {
-                summary.record_skip();
-                summary.add_bytes(bytes);
-                report.record_skipped(operation, &source, Some(&destination));
-            }
-        },
-        Err(ref err) => {
-            summary.record_failure(bytes);
-            report.record_failure(operation, &source, Some(&destination), err);
-            eprintln!(
-                "warn: copy failed source={} destination={} error={}",
-                source, destination, err
-            );
         }
-    }
+    })
 }
 
 async fn delete_recursive_move_sources_tos(
@@ -5149,20 +5300,22 @@ async fn delete_move_source_item_group(
                 break;
             };
             in_flight.push(async move {
-                let result = delete_move_source_item(client, item).await;
+                let result =
+                    capture_report_result(async { delete_move_source_item(client, item).await })
+                        .await;
                 (item.source.clone(), result)
             });
         }
         let Some((source, result)) = in_flight.next().await else {
             break;
         };
-        match result {
+        result.record(|result| match result {
             Ok(()) => report.record_success("delete-source", &source, None),
             Err(err) => {
                 eprintln!("warn: failed to delete source {}: {}", source, err);
                 report.record_failure("delete-source", &source, None, &err);
             }
-        }
+        });
         if let Some(bar) = progress {
             bar.inc(1);
         }
@@ -5194,13 +5347,17 @@ async fn delete_tos_recursive_move_source_root(
         report.record_skipped("delete-source", &source_uri, None);
         return;
     }
-    match delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None).await {
+    capture_report_result(async {
+        delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None).await
+    })
+    .await
+    .record(|result| match result {
         Ok(_) => report.record_success("delete-source", &source_uri, None),
         Err(err) => {
             eprintln!("warn: failed to delete source {}: {}", source_uri, err);
             report.record_failure("delete-source", &source_uri, None, &err);
         }
-    }
+    });
 }
 
 fn tos_recursive_move_source_root(args: &MvArgs) -> Option<(String, String, String)> {
@@ -5469,15 +5626,12 @@ async fn execute_sync_local_to_tos(
     manifest_path: Option<&str>,
     progress_enabled: bool,
 ) -> Result<i32, CliError> {
-    let source_root = Path::new(&args.source);
     let mut destination = parse_tos_uri(&args.destination, true)?;
     normalize_recursive_tos_target(&mut destination);
     let destination_prefix = destination.key.clone().unwrap_or_default();
-    let parent_prefix = recursive_source_parent_prefix(&args.source, args.include_parent)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     let mut scan_progress =
         RemoteScanProgress::new(list_echo_enabled, "ve-tos sync plan", &args.destination);
-    let files = collect_local_files(source_root)?;
     let destination_manifest = list_object_entries_for_bucket_with_progress(
         client,
         &destination.bucket,
@@ -5489,45 +5643,13 @@ async fn execute_sync_local_to_tos(
     .into_iter()
     .map(|entry| (entry.key.clone(), entry))
     .collect::<HashMap<_, _>>();
-    let mut desired_keys = HashSet::new();
-
-    let planned: Vec<_> = files
-        .into_iter()
-        .filter_map(|file| {
-            let relative = file.strip_prefix(source_root).ok()?;
-            let relative_key = relative.to_string_lossy().replace('\\', "/");
-            if !pattern_allows(
-                &relative_key,
-                args.include.as_deref(),
-                args.exclude.as_deref(),
-            ) {
-                return None;
-            }
-            let target_relative_key =
-                prepend_parent_prefix(&relative_key, parent_prefix.as_deref());
-            let key = join_tos_key(&destination_prefix, &target_relative_key);
-            desired_keys.insert(key.clone());
-            let local_size = fs::metadata(&file).ok()?.len();
-            Some((file, key, local_size))
-        })
-        .collect();
-
-    let mut extras = if args.delete {
-        destination_manifest
-            .values()
-            .filter(|entry| {
-                let relative_key = strip_tos_prefix(&entry.key, &destination_prefix);
-                pattern_allows(
-                    relative_key,
-                    args.include.as_deref(),
-                    args.exclude.as_deref(),
-                ) && !desired_keys.contains(&entry.key)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let (planned, mut desired_keys) = build_local_upload_sync_plan(args, &destination_prefix)?;
+    let mut extras = plan_local_upload_sync_extras(
+        args,
+        &destination_prefix,
+        &destination_manifest,
+        &mut desired_keys,
+    )?;
     if args.delete && !extras.is_empty() && bucket_is_hns(client, &destination.bucket).await? {
         // [Review Fix #1] HNS directory-marker objects must be deleted after their children.
         sort_tos_sync_delete_entries_bottom_up(&mut extras);
@@ -5607,10 +5729,16 @@ async fn execute_sync_local_to_tos(
             };
             let source = file.to_string_lossy().into_owned();
             let target = format!("tos://{}/{}", destination.bucket, key);
-            if remote_sync_should_skip(local_size, destination_manifest.get(&key), args) {
+            if if key.ends_with('/') {
+                destination_manifest
+                    .get(&key)
+                    .is_some_and(|entry| entry.size == 0)
+            } else {
+                remote_sync_should_skip(local_size, destination_manifest.get(&key), args)
+            } {
                 skipped += 1;
                 summary.record_skip();
-                summary.add_bytes(local_size);
+                summary.add_bytes(directory_progress_bytes(&source, &target, local_size));
                 report.record_skipped("sync-copy", &source, Some(&target));
                 continue;
             }
@@ -5618,22 +5746,25 @@ async fn execute_sync_local_to_tos(
             let checkpoint_dir = args.checkpoint_dir.as_deref();
             let write_options = write_options.clone();
             in_flight.push(async move {
-                let result = copy_one(
-                    global,
-                    client,
-                    &source,
-                    &target,
-                    runtime.copy_options(
-                        None,
-                        false,
-                        true,
-                        checkpoint_dir,
-                        write_options,
-                        progress_enabled,
-                        true,
-                        overall_bar_ref,
-                    ),
-                )
+                let result = capture_report_result(async {
+                    copy_one(
+                        global,
+                        client,
+                        &source,
+                        &target,
+                        runtime.copy_options(
+                            None,
+                            false,
+                            true,
+                            checkpoint_dir,
+                            write_options,
+                            progress_enabled,
+                            true,
+                            overall_bar_ref,
+                        ),
+                    )
+                    .await
+                })
                 .await;
                 (source, target, local_size, result)
             });
@@ -5641,17 +5772,17 @@ async fn execute_sync_local_to_tos(
         let Some((source, target, local_size, result)) = in_flight.next().await else {
             break;
         };
-        match result {
+        result.record(|result| match result {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
                     summary.record_success(local_size);
-                    report.record_success("sync-copy", &source, Some(&target));
+                    report.record_copy_result("sync-copy", &source, &target, &result);
                     uploaded += 1;
                 }
                 CopyOutcome::Skipped => {
                     summary.record_skip();
-                    summary.add_bytes(local_size);
-                    report.record_skipped("sync-copy", &source, Some(&target));
+                    summary.add_bytes(directory_progress_bytes(&source, &target, local_size));
+                    report.record_copy_result("sync-copy", &source, &target, &result);
                     skipped += 1;
                 }
             },
@@ -5660,7 +5791,7 @@ async fn execute_sync_local_to_tos(
                 report.record_failure("sync-copy", &source, Some(&target), &err);
                 eprintln!("warn: sync upload failed source={} error={}", source, err);
             }
-        }
+        });
     }
     if let Some(bar) = &summary.overall {
         bar.finish();
@@ -5701,15 +5832,18 @@ async fn execute_sync_local_to_tos(
                 }
                 break;
             }
-            match delete_tos_object(
-                client,
-                "ve-tos sync delete-extra",
-                &destination.bucket,
-                &entry.key,
-                entry.etag.as_deref(),
-            )
+            capture_report_result(async {
+                delete_tos_object(
+                    client,
+                    "ve-tos sync delete-extra",
+                    &destination.bucket,
+                    &entry.key,
+                    entry.etag.as_deref(),
+                )
+                .await
+            })
             .await
-            {
+            .record(|result| match result {
                 Ok(_) => {
                     deleted += 1;
                     report.record_success("delete-extra", &uri, None);
@@ -5718,7 +5852,7 @@ async fn execute_sync_local_to_tos(
                     report.record_failure("delete-extra", &uri, None, &err);
                     eprintln!("warn: sync delete-extra failed {}: {}", uri, err);
                 }
-            }
+            });
             if let Some(b) = &del_bar {
                 b.inc(1);
             }
@@ -5800,28 +5934,36 @@ async fn execute_cp_recursive(
     let runtime = effective_cp_runtime_config(profile, args)?;
     let mut scan_progress =
         RemoteScanProgress::new(list_echo_enabled, "ve-tos cp plan", &args.source);
+    let is_local_directory_upload = is_local_upload(&args.source, &args.destination);
     let mappings = build_recursive_copy_mappings(
         client,
         &args.source,
         &args.destination,
         RecursiveMappingOptions {
             include_parent: args.include_parent,
+            directory_upload_policy: Some(DirectoryUploadPolicy::from_disabled(
+                args.disable_dir_object,
+            )),
             recursive_list_mode: args.recursive_list_mode,
             list_concurrency: runtime.list_concurrency,
             scan_progress: Some(&mut scan_progress),
         },
     )
     .await?;
-    let planned: Vec<_> = mappings
-        .into_iter()
-        .filter(|item| {
-            pattern_allows(
-                &item.relative_key,
-                args.include.as_deref(),
-                args.exclude.as_deref(),
-            )
-        })
-        .collect();
+    let planned = if is_local_directory_upload {
+        filter_local_cp_upload_mappings(args, mappings)?
+    } else {
+        mappings
+            .into_iter()
+            .filter(|item| {
+                pattern_allows(
+                    &item.relative_key,
+                    args.include.as_deref(),
+                    args.exclude.as_deref(),
+                )
+            })
+            .collect()
+    };
     enforce_transfer_plan_path_traversal(
         global,
         "ve-tos cp",
@@ -5891,22 +6033,25 @@ async fn execute_cp_recursive(
             let write_options = write_options.clone();
 
             in_flight.push(async move {
-                let result = copy_one(
-                    global,
-                    client,
-                    &source,
-                    &destination,
-                    runtime.copy_options(
-                        None,
-                        false,
-                        checkpoint_enabled,
-                        checkpoint_dir,
-                        write_options,
-                        progress_enabled,
-                        true,
-                        overall_bar_ref,
-                    ),
-                )
+                let result = capture_report_result(async {
+                    copy_one(
+                        global,
+                        client,
+                        &source,
+                        &destination,
+                        runtime.copy_options(
+                            None,
+                            false,
+                            checkpoint_enabled,
+                            checkpoint_dir,
+                            write_options,
+                            progress_enabled,
+                            true,
+                            overall_bar_ref,
+                        ),
+                    )
+                    .await
+                })
                 .await;
                 (source, destination, bytes, result)
             });
@@ -6036,22 +6181,25 @@ impl<'a> TosStreamCopyContext<'a> {
         let checkpoint_dir = self.args.checkpoint_dir.as_deref();
         let write_options = self.write_options.clone();
         self.in_flight.push(Box::pin(async move {
-            let result = copy_one(
-                global,
-                client,
-                &source,
-                &destination,
-                runtime.copy_options(
-                    None,
-                    false,
-                    checkpoint_enabled,
-                    checkpoint_dir,
-                    write_options,
-                    false,
-                    true,
-                    None,
-                ),
-            )
+            let result = capture_report_result(async {
+                copy_one(
+                    global,
+                    client,
+                    &source,
+                    &destination,
+                    runtime.copy_options(
+                        None,
+                        false,
+                        checkpoint_enabled,
+                        checkpoint_dir,
+                        write_options,
+                        false,
+                        true,
+                        None,
+                    ),
+                )
+                .await
+            })
             .await;
             (source, destination, bytes, result)
         }));
@@ -6080,6 +6228,9 @@ impl<'a> TosStreamCopyContext<'a> {
 async fn stream_cp_local_source_no_manifest(
     context: &mut TosStreamCopyContext<'_>,
 ) -> Result<(), CliError> {
+    if context.args.destination.starts_with("tos://") {
+        return stream_cp_local_upload(context).await;
+    }
     let source_root = Path::new(&context.args.source);
     if !source_root.is_dir() {
         return Err(CliError::ValidationError(format!(
@@ -6357,29 +6508,31 @@ fn record_tos_stream_copy_result(
     source: String,
     destination: String,
     _bytes: u64,
-    result: Result<CopyTransferResult, CliError>,
+    result: impl Into<ReportedResult<CopyTransferResult>>,
 ) {
-    if let Some(progress) = progress {
-        progress.inc(1);
-    }
-    // [Review Fix #1] The no-manifest path must use the same directional
-    // operation contract as manifest-backed recursive cp.
-    let operation = cp_transfer_operation(&source, &destination);
-    match result {
-        Ok(result) if result.is_skipped() => {
-            report.record_skipped(operation, &source, Some(&destination));
+    result.into().record(|result| {
+        if let Some(progress) = progress {
+            progress.inc(1);
         }
-        Ok(_) => {
-            report.record_success(operation, &source, Some(&destination));
+        // [Review Fix #1] The no-manifest path must use the same directional
+        // operation contract as manifest-backed recursive cp.
+        let operation = cp_transfer_operation(&source, &destination);
+        match result {
+            Ok(result) if result.is_skipped() => {
+                report.record_copy_result(operation, &source, &destination, &result);
+            }
+            Ok(result) => {
+                report.record_copy_result(operation, &source, &destination, &result);
+            }
+            Err(ref err) => {
+                report.record_failure(operation, &source, Some(&destination), err);
+                eprintln!(
+                    "warn: copy failed source={} destination={} error={}",
+                    source, destination, err
+                );
+            }
         }
-        Err(ref err) => {
-            report.record_failure(operation, &source, Some(&destination), err);
-            eprintln!(
-                "warn: copy failed source={} destination={} error={}",
-                source, destination, err
-            );
-        }
-    }
+    })
 }
 
 async fn execute_sync_recursive(
@@ -6400,6 +6553,7 @@ async fn execute_sync_recursive(
         &args.destination,
         RecursiveMappingOptions {
             include_parent: args.include_parent,
+            directory_upload_policy: None,
             recursive_list_mode: args.recursive_list_mode,
             list_concurrency: runtime.list_concurrency,
             scan_progress: Some(&mut scan_progress),
@@ -6497,22 +6651,25 @@ async fn execute_sync_recursive(
             let write_options = write_options.clone();
 
             in_flight.push(async move {
-                let result = copy_one(
-                    global,
-                    client,
-                    &source,
-                    &destination,
-                    runtime.copy_options(
-                        None,
-                        false,
-                        true,
-                        checkpoint_dir,
-                        write_options,
-                        progress_enabled,
-                        true,
-                        overall_bar_ref,
-                    ),
-                )
+                let result = capture_report_result(async {
+                    copy_one(
+                        global,
+                        client,
+                        &source,
+                        &destination,
+                        runtime.copy_options(
+                            None,
+                            false,
+                            true,
+                            checkpoint_dir,
+                            write_options,
+                            progress_enabled,
+                            true,
+                            overall_bar_ref,
+                        ),
+                    )
+                    .await
+                })
                 .await;
                 (source, destination, bytes, result)
             });
@@ -6521,17 +6678,17 @@ async fn execute_sync_recursive(
         let Some((src, dst, b, result)) = in_flight.next().await else {
             break;
         };
-        match result {
+        result.record(|result| match result {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
                     summary.record_success(b);
-                    report.record_success("sync-copy", &src, Some(&dst));
+                    report.record_copy_result("sync-copy", &src, &dst, &result);
                     copied += 1;
                 }
                 CopyOutcome::Skipped => {
                     summary.record_skip();
                     summary.add_bytes(b);
-                    report.record_skipped("sync-copy", &src, Some(&dst));
+                    report.record_copy_result("sync-copy", &src, &dst, &result);
                     skipped += 1;
                 }
             },
@@ -6543,7 +6700,7 @@ async fn execute_sync_recursive(
                     src, dst, err
                 );
             }
-        }
+        });
     }
 
     if let Some(bar) = &summary.overall {
@@ -6630,18 +6787,27 @@ async fn copy_one(
     destination: &str,
     options: CopyOptions<'_>,
 ) -> Result<CopyTransferResult, CliError> {
-    let outcome = match (
-        source.starts_with("tos://"),
-        destination.starts_with("tos://"),
-    ) {
-        (false, true) => upload_local_to_tos(global, client, source, destination, options).await?,
-        (true, false) => {
-            download_tos_to_local(global, client, source, destination, options).await?
+    // [Review Fix #21] Each file gets an unbounded-by-command terminal response scope.
+    let (outcome, request_id) = capture_service_request_id(async {
+        match (
+            source.starts_with("tos://"),
+            destination.starts_with("tos://"),
+        ) {
+            (false, true) => {
+                upload_local_to_tos(global, client, source, destination, options).await
+            }
+            (true, false) => {
+                download_tos_to_local(global, client, source, destination, options).await
+            }
+            (true, true) => copy_tos_to_tos(global, client, source, destination, options).await,
+            (false, false) => copy_local_to_local(global, source, destination, options),
         }
-        (true, true) => copy_tos_to_tos(global, client, source, destination, options).await?,
-        (false, false) => copy_local_to_local(global, source, destination, options)?,
-    };
-    Ok(outcome)
+    })
+    .await;
+    outcome.map(|mut outcome| {
+        outcome.request_id = request_id;
+        outcome
+    })
 }
 
 async fn upload_local_to_tos(
@@ -6654,6 +6820,9 @@ async fn upload_local_to_tos(
     let target = parse_tos_uri(destination, false)?;
     let key = target.key.expect("validated object key");
     let metadata = fs::metadata(source)?;
+    if metadata.is_dir() {
+        return upload_directory_to_tos(global, client, source, destination, options).await;
+    }
     let file_size = metadata.len();
     if should_skip_upload_for_overwrite_strategy(
         client,
@@ -8318,10 +8487,10 @@ fn execute_cp_recursive_local(
         ) {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
-                    report.record_success(operation, &item.source, Some(&item.destination));
+                    report.record_copy_result(operation, &item.source, &item.destination, &result);
                 }
                 CopyOutcome::Skipped => {
-                    report.record_skipped(operation, &item.source, Some(&item.destination));
+                    report.record_copy_result(operation, &item.source, &item.destination, &result);
                 }
             },
             Err(err) => {
@@ -8718,7 +8887,11 @@ async fn put_tos_multipart_stdin_object(
             {
                 Ok(completed) => completed,
                 Err(err) => {
-                    let _ = abort_tos_multipart_upload(client, bucket, key, &upload_id).await;
+                    // [Review Fix #21] Best-effort cleanup must not replace the failed operation ID.
+                    let _ = without_operation_request_tracking(abort_tos_multipart_upload(
+                        client, bucket, key, &upload_id,
+                    ))
+                    .await;
                     return Err(err);
                 }
             };
@@ -8746,7 +8919,11 @@ async fn put_tos_multipart_stdin_object(
             Ok(())
         }
         Err(err) => {
-            let _ = abort_tos_multipart_upload(client, bucket, key, &upload_id).await;
+            // [Review Fix #21] Best-effort cleanup must not replace the failed operation ID.
+            let _ = without_operation_request_tracking(abort_tos_multipart_upload(
+                client, bucket, key, &upload_id,
+            ))
+            .await;
             Err(err)
         }
     }
@@ -9358,6 +9535,13 @@ fn tos_high_level_command_path(command: &TosCommand) -> &'static str {
 
 fn cp_operation(args: &CpArgs) -> Result<HighLevelOperation, CliError> {
     validate_transfer_pair(&args.source, &args.destination, args.recursive)?;
+    validate_directory_upload_option(&args.source, &args.destination, args.disable_dir_object)?;
+    // [Review Fix #Directory-Scope] Directory execution is authorized only for recursive cp.
+    if !args.recursive && is_local_upload(&args.source, &args.destination) {
+        return Err(CliError::ValidationError(
+            "copying a local directory requires --recursive".into(),
+        ));
+    }
     let write_options = copy_write_options(args)?;
     ensure_tos_write_destination("ve-tos cp", &args.destination, &write_options)?;
     ensure_tos_upload_storage_class_supported(
@@ -9398,6 +9582,11 @@ fn cp_operation(args: &CpArgs) -> Result<HighLevelOperation, CliError> {
         force: args.force,
         requires_force: false,
         consistency_guards: vec![
+            if is_local_upload(&args.source, &args.destination) {
+                directory_policy_guard(args.disable_dir_object)
+            } else {
+                "directory policy: explicit directory uploads apply only to local-directory uploads"
+            },
             "download: GetObject uses If-Match or version_id and writes temp file before rename",
             // [Review Fix #4] Runtime descriptions must match the SHA256-only
             // high-level upload contract and must not advertise an unsupported header.
@@ -9473,6 +9662,7 @@ fn mv_operation(args: &MvArgs) -> Result<HighLevelOperation, CliError> {
 
 fn sync_operation(args: &SyncArgs) -> Result<HighLevelOperation, CliError> {
     validate_transfer_pair(&args.source, &args.destination, true)?;
+    validate_directory_upload_option(&args.source, &args.destination, args.disable_dir_object)?;
     let write_options = sync_write_options(args)?;
     ensure_tos_write_destination("ve-tos sync", &args.destination, &write_options)?;
     ensure_tos_upload_storage_class_supported(
@@ -9504,6 +9694,11 @@ fn sync_operation(args: &SyncArgs) -> Result<HighLevelOperation, CliError> {
         force: args.force,
         requires_force: args.delete,
         consistency_guards: vec![
+            if is_local_upload(&args.source, &args.destination) {
+                directory_policy_guard(args.disable_dir_object)
+            } else {
+                "directory policy: explicit directory uploads apply only to local-directory uploads"
+            },
             "plan compares size and mtime unless size-only or exact-timestamps changes strategy",
             "transfer phase follows cp consistency guards",
             "delete phase requires --force and records every removed item",
@@ -11366,6 +11561,7 @@ fn transfer_parameters(include_checkpoint_flag: bool) -> Vec<CommandParameter> {
         ),
     ];
     if include_checkpoint_flag {
+        params.push(directory_upload_parameter());
         params.push(param(
             "checkpoint",
             ParameterLocation::Flag,
@@ -11378,6 +11574,7 @@ fn transfer_parameters(include_checkpoint_flag: bool) -> Vec<CommandParameter> {
 
 fn sync_parameters() -> Vec<CommandParameter> {
     vec![
+        directory_upload_parameter(),
         param(
             "source",
             ParameterLocation::Path,
@@ -12451,7 +12648,10 @@ async fn build_recursive_copy_mappings(
         destination.starts_with("tos://"),
     ) {
         (false, false) => build_local_source_mappings(source, destination, options.include_parent),
-        (false, true) => build_local_source_mappings(source, destination, options.include_parent),
+        (false, true) => match options.directory_upload_policy {
+            Some(_) => build_local_upload_mappings(source, destination, &options),
+            None => build_local_source_mappings(source, destination, options.include_parent),
+        },
         (true, false) | (true, true) => {
             build_tos_source_mappings(client, source, destination, options).await
         }
@@ -12517,6 +12717,7 @@ async fn build_tos_source_mappings(
 ) -> Result<Vec<TransferPlanItem>, CliError> {
     let RecursiveMappingOptions {
         include_parent,
+        directory_upload_policy: _,
         recursive_list_mode,
         list_concurrency,
         scan_progress,
@@ -12743,14 +12944,16 @@ async fn delete_sync_delete_item_group(
                 break;
             };
             in_flight.push(async move {
-                let result = delete_sync_delete_item(client, &item).await;
+                let result =
+                    capture_report_result(async { delete_sync_delete_item(client, &item).await })
+                        .await;
                 (item, result)
             });
         }
         let Some((item, result)) = in_flight.next().await else {
             break;
         };
-        match result {
+        result.record(|result| match result {
             Ok(()) => {
                 deleted += 1;
                 report.record_success("delete-extra", &item.source, None);
@@ -12759,7 +12962,7 @@ async fn delete_sync_delete_item_group(
                 report.record_failure("delete-extra", &item.source, None, &err);
                 eprintln!("warn: sync delete-extra failed {}: {}", item.source, err);
             }
-        }
+        });
         if let Some(bar) = progress {
             bar.inc(1);
         }
@@ -15983,7 +16186,54 @@ const TOS_REPORT_COLUMNS: &[&str] = &[
     "retryable",
     "schema_version",
     "action_id",
+    "request_id",
 ];
+
+// [Review Fix #21] Report columns evolve independently of manifest action identity.
+const TOS_CSV_REPORT_SCHEMA_VERSION: u8 = 3;
+
+tokio::task_local! {
+    static REPORT_REQUEST_ID: Option<String>;
+}
+
+fn report_request_id() -> Option<String> {
+    scoped_report_request_id().flatten()
+}
+
+fn scoped_report_request_id() -> Option<Option<String>> {
+    REPORT_REQUEST_ID
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| has_operation_request_scope().then(current_service_request_id))
+}
+
+fn report_error_request_id(error: &CliError) -> Option<String> {
+    // [Review Fix #21] A captured missing header is authoritative over untrusted error text.
+    scoped_report_request_id().unwrap_or_else(|| error_service_request_id(error))
+}
+
+fn with_report_request_id<T>(request_id: Option<String>, record: impl FnOnce() -> T) -> T {
+    // [Review Fix #21] Restore only this completed item's ID while recording its row.
+    REPORT_REQUEST_ID.sync_scope(request_id, record)
+}
+
+fn error_service_request_id(error: &CliError) -> Option<String> {
+    // [Review Fix #21] agent_semantics may fall back to a different file's process ID.
+    let message = error.to_string();
+    let (_, service_message) = message.split_once(": HTTP ")?;
+    let status = service_message
+        .split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
+    let marker = "(RequestId:";
+    let start = message.rfind(marker)? + marker.len();
+    let end = message[start..].find(')')? + start;
+    sanitize_request_id(&message[start..end])
+}
 
 fn transfer_action_fingerprint(
     operation: &str,
@@ -16296,6 +16546,7 @@ fn append_tos_report_record(report_path: &str, fields: &[String]) -> Result<(), 
     // [Review Fix #1] Legacy per-item report hooks must also write CSV part files;
     // otherwise batch commands can leave stale JSONL beside the final CSV report.
     let header_line = csv_record(TOS_REPORT_COLUMNS.iter().copied());
+    validate_tos_report_header(report_path, &header_line)?;
     let (mut file, _) =
         RollingCsvWriter::open_part(Path::new(report_path), 1, &header_line, false)?;
     let line = csv_record(fields.iter().map(String::as_str));
@@ -16303,11 +16554,30 @@ fn append_tos_report_record(report_path: &str, fields: &[String]) -> Result<(), 
     Ok(())
 }
 
+fn validate_tos_report_header(report_path: &str, expected_header: &str) -> Result<(), CliError> {
+    let file = match File::open(report_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(CliError::Io(error)),
+    };
+    let mut header = String::new();
+    BufReader::new(file)
+        .take(expected_header.len() as u64 + 1)
+        .read_line(&mut header)?;
+    // [Review Fix #21] Appending new-width rows to a legacy header corrupts the CSV schema.
+    if !header.is_empty() && header != expected_header {
+        return Err(CliError::ValidationError(
+            "report CSV header is incompatible; choose a new report path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn tos_report_record(
     command: &str,
     item: &BatchItemResult,
     action_id: Option<u64>,
-) -> [String; 11] {
+) -> [String; 12] {
     [
         command.to_string(),
         item.operation.clone(),
@@ -16320,8 +16590,9 @@ fn tos_report_record(
             .unwrap_or_default(),
         item.message.clone().unwrap_or_default(),
         item.retryable.to_string(),
-        TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
+        TOS_CSV_REPORT_SCHEMA_VERSION.to_string(),
         action_id.map(|value| value.to_string()).unwrap_or_default(),
+        item.request_id.clone().unwrap_or_default(),
     ]
 }
 
@@ -16347,8 +16618,9 @@ fn write_single_report(
             String::new(),
             String::new(),
             "false".to_string(),
-            TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
+            TOS_CSV_REPORT_SCHEMA_VERSION.to_string(),
             String::new(),
+            report_request_id().unwrap_or_default(),
         ],
     )
 }
@@ -16600,8 +16872,9 @@ fn write_error_report(
             err.exit_code().as_i32().to_string(),
             err.to_string(),
             is_retryable_error(err).to_string(),
-            TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
+            TOS_CSV_REPORT_SCHEMA_VERSION.to_string(),
             String::new(),
+            report_error_request_id(err).unwrap_or_default(),
         ],
     )
 }
@@ -16904,6 +17177,7 @@ mod tests {
             destination: destination.to_string(),
             recursive,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint: false,
@@ -16974,6 +17248,7 @@ mod tests {
             size_only: false,
             exact_timestamps: false,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint_dir: None,
@@ -17668,8 +17943,8 @@ mod tests {
             .lines()
             .skip(1)
             .map(|line| {
-                line.rsplit(',')
-                    .next()
+                line.split(',')
+                    .nth(10)
                     .expect("action id column")
                     .parse::<u64>()
                     .expect("numeric action id")
@@ -17703,7 +17978,7 @@ mod tests {
         let action_ids = body
             .lines()
             .skip(1)
-            .map(|line| line.rsplit(',').next().expect("action id"))
+            .map(|line| line.split(',').nth(10).expect("action id"))
             .collect::<Vec<_>>();
         assert_eq!(action_ids, vec!["1", "2"]);
     }
@@ -19293,6 +19568,7 @@ mod tests {
             size_only: true,
             exact_timestamps: false,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint_dir: None,
@@ -19347,6 +19623,7 @@ mod tests {
             size_only: true,
             exact_timestamps: false,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint_dir: None,
@@ -19519,6 +19796,7 @@ mod tests {
             size_only: false,
             exact_timestamps: true,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint_dir: None,
@@ -19559,6 +19837,7 @@ mod tests {
             size_only,
             exact_timestamps,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint_dir: None,

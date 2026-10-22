@@ -14,21 +14,24 @@ pub fn describe_share_command(command: &str) -> Option<Value> {
         return None;
     }
     let row = find_capability(command)?;
-    Some(
-        json!({"command":command,"layer":row.layer,"description":row.description,
-            "risk_level":row.risk_level,"supports_dry_run":true,"supports_pipe":true,
-            // [Review Fix #Rebase5] Expose the cancellation gate consistently
-            // with capabilities and doctor without changing critical deletes.
-            "destructive":row.destructive,"supports_force":row.supports_force,
-            "supports_yes":supports_yes(command),
-            "parameters":row.parameters.iter().map(|item| parameter(command,item)).collect::<Vec<_>>(),
-            "output_schema": output_schema(command),
-            // [Review Fix #LiveDocs1] Describe/MCP guidance must expose the same connection and root rules as help.
-            "semantics": share_semantics(command),
-            "low_level_apis":row.api_actions,"wraps_apis":row.api_actions,
-            "examples":row.examples,"side_effects":if matches!(command.rsplit(' ').next(),Some("create"|"update"|"cancel")) { vec!["Share settings are mutable; the shared target cannot change."] } else if command.ends_with(" view") {vec![crate::cli::share::SHARE_VIEW_HELP]} else if matches!(command.rsplit(' ').next(),Some("inspect"|"files"|"download")) { vec![crate::cli::share::SHARE_RECEIVER_HELP] } else {vec![]}
-        }),
-    )
+    let mut description = json!({"command":command,"layer":row.layer,"description":row.description,
+        "risk_level":row.risk_level,"supports_dry_run":true,"supports_pipe":true,
+        // [Review Fix #Rebase5] Expose the cancellation gate consistently
+        // with capabilities and doctor without changing critical deletes.
+        "destructive":row.destructive,"supports_force":row.supports_force,
+        "supports_yes":supports_yes(command),
+        "parameters":row.parameters.iter().map(|item| parameter(command,item)).collect::<Vec<_>>(),
+        "output_schema": output_schema(command),
+        // [Review Fix #LiveDocs1] Describe/MCP guidance must expose the same connection and root rules as help.
+        "semantics": share_semantics(command),
+        "low_level_apis":row.api_actions,"wraps_apis":row.api_actions,
+        "examples":row.examples,"side_effects":share_side_effects(command)
+    });
+    // [Review Fix #D02Docs] Planning has its own shape; preserve the approved real-download output contract.
+    if command == "ve-adrive share download" {
+        description["dry_run_output_schema"] = download_dry_run_output_schema();
+    }
+    Some(description)
 }
 
 fn share_semantics(command: &str) -> Vec<&'static str> {
@@ -41,6 +44,8 @@ fn share_semantics(command: &str) -> Vec<&'static str> {
     }
     if command == "ve-adrive share download" {
         semantics.push(crate::cli::share::SHARE_DOWNLOAD_HELP);
+        // [Review Fix #ShareDownloadSelectionDocs] Retain selection and password rules without files-only pagination flags.
+        semantics.push(crate::cli::share::SHARE_DOWNLOAD_SELECTION_HELP);
     }
     if command == "ve-adrive share view" {
         semantics.push(crate::cli::share::SHARE_VIEW_HELP);
@@ -58,10 +63,73 @@ fn share_semantics(command: &str) -> Vec<&'static str> {
     ) {
         semantics.push(crate::cli::share::SHARE_RECEIVER_HELP);
     }
-    if matches!(command.rsplit(' ').next(), Some("files" | "download")) {
+    // [Review Fix #ShareFilesMaxKeysDocs] Pagination controls belong only to files; download enumerates its complete selection.
+    if command == "ve-adrive share files" {
         semantics.push(crate::cli::share::SHARE_FILES_HELP);
     }
+    append_planning_semantics(command, &mut semantics);
     semantics
+}
+
+fn append_planning_semantics(command: &str, semantics: &mut Vec<&'static str>) {
+    // [Review Fix #D02D05Docs] Help, Describe, generated skills and MCP must share the same read-only/input boundary.
+    if command == "ve-adrive share download" {
+        semantics.push(crate::cli::share::SHARE_DRY_RUN_HELP);
+    }
+    if supports_password(command) {
+        semantics.push(crate::cli::share::SHARE_PASSWORD_HELP);
+    }
+    semantics.push(crate::cli::share::SHARE_OFFLINE_HELP);
+}
+
+fn share_side_effects(command: &str) -> Vec<&'static str> {
+    // [Review Fix #D02Docs] A non-destructive transfer still writes locally and URL issuance can consume quota.
+    match command.rsplit(' ').next() {
+        Some("create" | "update" | "cancel") => {
+            vec!["Share settings are mutable; the shared target cannot change."]
+        }
+        Some("download") => vec![
+            crate::cli::share::SHARE_RECEIVER_HELP,
+            crate::cli::share::SHARE_DOWNLOAD_HELP,
+            crate::cli::share::SHARE_DRY_RUN_HELP,
+        ],
+        Some("view") => vec![crate::cli::share::SHARE_VIEW_HELP],
+        Some("inspect" | "files") => vec![crate::cli::share::SHARE_RECEIVER_HELP],
+        _ => vec![],
+    }
+}
+
+fn download_dry_run_output_schema() -> Value {
+    json!({"type":"object","required":["dry_run","action","execution_status","selection"],"properties":{
+        "dry_run":{"const":true},"action":{"const":"download"},
+        "execution_status":{"const":"planned_not_executed"},
+        "selection":download_plan_selection_schema()
+    }})
+}
+
+fn download_plan_selection_schema() -> Value {
+    json!({"type":"object","required":["Manifest","PlanComplete","FileCount","DirectoryCount","TotalBytes","SkippedCount","Conflicts","NetworkRequests","MetadataResponses","DownloadsIssued","LocalWrites","SnapshotGuaranteed"],"properties":{
+            "ShareUrl":{"type":"string","format":"uri"},"Path":{"type":["string","null"]},
+            "DestinationDir":{"type":"string"},"Checkpoint":{"type":["string","null"]},
+            "Resume":{"type":"boolean"},"Recursive":{"type":"boolean"},"Overwrite":{"type":"boolean"},
+            "PlanComplete":{"const":true},"FileCount":{"type":"integer","minimum":0},
+            "DirectoryCount":{"type":"integer","minimum":0},"TotalBytes":{"type":"integer","minimum":0},
+            "SkippedCount":{"type":"integer","minimum":0},"Conflicts":{"type":"array","items":{"type":"object"}},
+            "NetworkRequests":{"type":"null"},"MetadataResponses":{"type":"integer","minimum":0},
+            "DownloadsIssued":{"const":0},"LocalWrites":{"const":false},"SnapshotGuaranteed":{"const":false},
+            "Manifest":download_plan_manifest_schema()
+    }})
+}
+
+fn download_plan_manifest_schema() -> Value {
+    json!({"type":"object","required":["Roots","Files","Directories"],"properties":{
+                "Roots":{"type":"array","items":{"type":"string"}},
+                "Files":{"type":"array","items":{"type":"object","required":["FilePath","LocalPath","DestinationPath","Size","Action"],"properties":{
+                    "FilePath":{"type":"string"},"LocalPath":{"type":"string"},"DestinationPath":{"type":"string"},
+                    "Size":{"type":"integer","minimum":0},"Action":{"enum":["create","overwrite","skip","conflict"]}}}},
+                "Directories":{"type":"array","items":{"type":"object","required":["LocalPath","DestinationPath","Action"],"properties":{
+                    "LocalPath":{"type":"string"},"DestinationPath":{"type":"string"},"Action":{"enum":["create","existing","conflict"]}}}}
+    }})
 }
 
 /// Return whether global `--yes` supplies this share command's confirmation.
@@ -109,6 +177,8 @@ fn parameter(command: &str, item: &RegistryParameter) -> Value {
 }
 
 /// Return the share-specific schema, preserving scalar types and explicit bool values.
+/// `command` is the canonical command path and `name` is a registry parameter.
+/// Returns its JSON schema without I/O; this lookup cannot fail.
 pub fn parameter_schema(command: &str, name: &str) -> Value {
     match name {
         "creator" => json!({"type":"array","items":{"type":"string"}}),
@@ -118,6 +188,10 @@ pub fn parameter_schema(command: &str, name: &str) -> Value {
         "updated-at" => json!({"type":"integer"}),
         "multipart-concurrency" => json!({"type":"integer","minimum":1,"default":4}),
         "checkpoint-threshold" => json!({"type":"string","default":"20MB"}),
+        // [Review Fix #ShareFilesMaxKeysSchema] Keep discovery and typed MCP validation aligned with the files CLI's bounded i32 cap.
+        "max-keys" if command == "ve-adrive share files" => {
+            json!({"type":"integer","minimum":1,"maximum":i32::MAX,"default":1000})
+        }
         "limit" => json!({"type":"integer","minimum":1}),
         "require-login" | "password-stdin" | "by-name" | "recursive" | "overwrite" | "resume"
         | "progress" | "no-progress" | "raw" => {
@@ -150,6 +224,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn files_describe_exposes_bounded_max_keys_without_legacy_limit() {
+        let description = describe_share_command("ve-adrive share files").unwrap();
+        let parameters = description["parameters"].as_array().unwrap();
+        let max_keys = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "max-keys")
+            .expect("files must advertise max-keys");
+        assert_eq!(max_keys["schema"]["type"], "integer");
+        assert_eq!(max_keys["schema"]["default"], 1000);
+        assert_eq!(max_keys["schema"]["minimum"], 1);
+        assert_eq!(max_keys["schema"]["maximum"], i32::MAX);
+        assert!(!parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "limit"));
+        let semantics = description["semantics"].to_string();
+        assert!(semantics.contains("--max-keys") && semantics.contains("1000"));
+        assert!(semantics.contains("--marker"));
+        assert!(!semantics.contains("one directory page"));
+    }
+
+    #[test]
+    fn download_semantics_exclude_files_only_pagination_flags() {
+        let description = describe_share_command("ve-adrive share download").unwrap();
+        let semantics = description["semantics"].to_string();
+        for flag in ["--max-keys", "--marker", "--limit"] {
+            assert!(!semantics.contains(flag), "download advertises {flag}");
+        }
+        assert!(semantics.contains("EOF"));
+        assert!(semantics.contains("default to anonymous"));
+    }
+
+    #[test]
+    fn download_describe_retains_automatic_selection_and_password_precedence() {
+        let description = describe_share_command("ve-adrive share download").unwrap();
+        let semantics = description["semantics"].to_string();
+        for phrase in [
+            "Downloads enumerate all selected service pages automatically",
+            "Exact file paths select one file",
+            "directory paths end in / and require --recursive",
+            "stdin > URL pwd > hidden ordinary-TTY prompt",
+            "passwords are not saved",
+        ] {
+            assert!(
+                semantics.contains(phrase),
+                "missing download guidance: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_describe_preserves_management_limit_schema() {
+        let description = describe_share_command("ve-adrive share list").unwrap();
+        let parameters = description["parameters"].as_array().unwrap();
+        let limit = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "limit")
+            .unwrap();
+        assert_eq!(limit["schema"], json!({"type":"integer","minimum":1}));
+        assert!(!parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "max-keys"));
+    }
+
+    #[test]
+    fn download_describe_separates_read_only_plan_schema_from_transfer_results() {
+        let description = describe_share_command("ve-adrive share download").unwrap();
+        let selection = &description["dry_run_output_schema"]["properties"]["selection"];
+        let required = selection["required"]
+            .as_array()
+            .expect("planner selection schema");
+        for field in [
+            "Manifest",
+            "PlanComplete",
+            "FileCount",
+            "DirectoryCount",
+            "TotalBytes",
+            "SkippedCount",
+            "Conflicts",
+            "MetadataResponses",
+        ] {
+            assert!(
+                required.contains(&json!(field)),
+                "missing planner field {field}"
+            );
+        }
+        assert_eq!(selection["properties"]["NetworkRequests"]["type"], "null");
+        assert_eq!(selection["properties"]["DownloadsIssued"]["const"], 0);
+        assert_eq!(selection["properties"]["LocalWrites"]["const"], false);
+        assert_eq!(
+            selection["properties"]["SnapshotGuaranteed"]["const"],
+            false
+        );
+        assert_eq!(
+            description["output_schema"]["required"],
+            json!(["Complete", "PlanComplete", "Summary", "Files"])
+        );
+        assert!(description["output_schema"]["properties"]
+            .get("selection")
+            .is_none());
+        assert!(describe_share_command("ve-adrive share files")
+            .unwrap()
+            .get("dry_run_output_schema")
+            .is_none());
+    }
+
+    #[test]
+    fn download_side_effects_disclose_local_writes_and_read_only_planning() {
+        let description = describe_share_command("ve-adrive share download").unwrap();
+        let side_effects = description["side_effects"].to_string();
+        for phrase in [
+            "temporary files",
+            "checkpoint",
+            "--overwrite",
+            "quota",
+            "metadata",
+            "no local writes",
+        ] {
+            assert!(
+                side_effects.contains(phrase),
+                "missing side effect {phrase}"
+            );
+        }
+    }
+
+    #[test]
     fn receiver_describe_exposes_explicit_oauth_and_pagination_rules() {
         for action in ["inspect", "files", "download"] {
             let value = describe_share_command(&format!("ve-adrive share {action}")).unwrap();
@@ -159,12 +358,11 @@ mod tests {
                     && semantics.contains("--auth-mode oauth")
             );
             assert!(semantics.contains("selected profile API or --endpoint"));
+            if action == "files" {
+                assert!(semantics.contains("--max-keys") && semantics.contains("--marker"));
+            }
             if action != "inspect" {
-                assert!(
-                    semantics.contains("--limit")
-                        && semantics.contains("--marker")
-                        && semantics.contains("EOF")
-                );
+                assert!(semantics.contains("EOF"));
             }
         }
     }

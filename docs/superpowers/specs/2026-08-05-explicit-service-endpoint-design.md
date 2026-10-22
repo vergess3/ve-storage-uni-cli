@@ -45,14 +45,15 @@ never inferred.
 requests require an explicit endpoint; region may be explicit or parsed from a
 recognizable IDS endpoint.
 
-OAuth login requires an explicit Authorization Server `auth_endpoint` from the
-command line, selected profile, or `ADRIVE_AUTH_ENDPOINT`. The built-in
-`https://idsauth.volces.com` fallback is removed. Resource endpoint and OAuth
-auth endpoint remain independent settings.
+2026-10-21 user-approved revision: OAuth login selects an Authorization Server
+`auth_endpoint` from the command line, selected profile, or `ADRIVE_AUTH_ENDPOINT`,
+then falls back to the effective Resource endpoint. There is no fixed
+`https://idsauth.volces.com` default. Auth and Resource can share an origin;
+explicit HTTP(S) protocols are preserved.
 
 Existing OAuth credentials that already store their resolved auth endpoint
-remain usable for refresh. The change affects new login attempts that do not
-provide an auth endpoint.
+remain usable for refresh. New login attempts without an explicit auth endpoint use the effective Resource
+endpoint; existing saved refresh endpoints remain unchanged.
 
 ## Resolution and precedence
 

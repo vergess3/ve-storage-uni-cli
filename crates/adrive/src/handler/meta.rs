@@ -104,13 +104,21 @@ const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
 // Exact owner catalog: identifiers inside each full phrase remain unchanged.
 const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     ("Path to config TOML", "配置 TOML 路径"),
     ("Path to credentials TOML", "凭据 TOML 路径"),
     ("Confirm share cancellation", "确认分享取消操作"),
     ("Share Links:", "分享链接："),
 
+    // [Review Fix #ShareReviewDocs] Translate the planning/input contract instead of falling back to English.
+    (crate::cli::share::SHARE_DRY_RUN_HELP, "Download --dry-run 仅通过只读的分享 info/token/list/get 元数据请求，枚举全部选中分页与递归目录，或校验已保存的恢复清单和已完成本地文件摘要。返回 selection.Manifest、PlanComplete=true、FileCount、DirectoryCount、TotalBytes、SkippedCount 和 Conflicts。完成的计划发现本地冲突时退出码为 9，并保留计划。DownloadsIssued=0、LocalWrites=false：不签发下载 URL、不拉取内容、不创建目录或临时文件、不写 checkpoint 或锁文件。MetadataResponses 统计收到的元数据响应；未统计网络尝试次数，因此 NetworkRequests=null。SnapshotGuaranteed=false：检查后远端内容和本地路径仍可能改变。 文件大小缺失或为负数时校验失败（退出码 6）；显式大小 0 是有效空文件。 OAuth 预演禁用自动刷新以避免凭据和认证锁写入。token 已过期、距到期 60 秒内或收到 401 时，请先正常执行 ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth 刷新，再重试。规划不获取 checkpoint 锁；已存在的普通锁文件可能正被使用。实际执行会重新检查状态并获取锁。"),
+    (crate::cli::share::SHARE_PASSWORD_HELP, "显式 --password-stdin 在移除末尾一个 LF 或 CRLF 后必须为非空密码；仅 EOF、LF 或 CRLF 的输入校验失败（退出码 6）。有意义的空格会保留。update 省略该参数时保留现有密码。create/update --dry-run 也读取并校验显式 stdin；--describe 和 --help 从不读取 stdin。"),
+    (crate::cli::share::SHARE_OFFLINE_HELP, "--describe 和 --help 不加载配置、不访问网络、不读取 stdin。分享命令的 --dry-run 除下载元数据规划外均离线执行。create/update 在 dry-run 时仍读取并校验显式 --password-stdin。"),
     (crate::cli::share::SHARE_RECEIVER_HELP, "inspect/files/view/download 默认匿名，即使 profile 配置了 OAuth。显式 --auth-mode oauth 通过 auth login/status 复用 --profile 和现有 token 刷新机制；不会自动登录或回退到其他身份。OAuth 用于分享概况及 token 交换；文件 API 仅使用 x-share-token，内容下载不携带账户凭据。服务端验证登录和分享权限；设置了提取码时仍须提供。公开 URL 支持 /share/<id> 和 /share/<id>/，末尾一个斜杠会被规范化移除。目录前缀通过 --path 指定，不追加到 URL 路径。"),
-    (crate::cli::share::SHARE_FILES_HELP, "files 返回一页目录：--limit 设置条数，--marker 使用上一页的 NextMarker；IsTruncated=false 时结束。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。Download 自动枚举各页。files 的默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。表格 Total 为展示行数；JSON 和显式 --query 保留服务原始数组。"),
+    // [Review Fix #ShareFilesMaxKeysZh] Translate the combined result cap and normalized pagination contract.
+    (crate::cli::share::SHARE_FILES_HELP, "files 与 ls 一样列举当前目录层级。--max-keys（默认 1000）限制文件和目录的合计条目数；自动获取服务分页，直到达到上限或列举结束。使用 --marker 传入上一次的 NextMarker 继续；IsTruncated=false 表示列举结束。不支持 --limit。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。所有输出模式均规范化目录标记、自身目录标记及重复项；Total 和 pagination.total_returned 统计相同的逻辑条目。JSON 和显式 --query 保留聚合且规范化后的 Files/Folders 元数据。"),
+    // [Review Fix #ShareDownloadSelectionZh] Download keeps its own selection/password guidance after the files help split.
+    (crate::cli::share::SHARE_DOWNLOAD_SELECTION_HELP, "下载自动枚举全部选中服务分页。精确文件路径选择一个文件；目录路径以 / 结尾，并需要 --recursive。密码优先级为 stdin > URL pwd > 普通终端隐藏提示；--password-stdin 读取到 EOF（使用管道），不会保存密码。"),
     ("Manage and receive share links", "管理和接收分享链接"),
     ("Create a share link", "创建分享链接"),
     ("Get a share link", "获取分享链接"),
@@ -305,7 +313,7 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value", "单次调用覆盖：--auth-mode <MODE>；支持值为 aksk、oauth 或 unified。环境变量由 ADRIVE_AUTH_MODE 提供"),
     ("Authentication action: status (default), login, or logout", "鉴权操作：status（默认）、login 或 logout"),
     ("OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it", "OAuth 登录 Instance；除非所选 profile 或 ADRIVE_DEFAULT_INSTANCE 已提供，否则必填"),
-    ("OAuth Authorization Server for login; required unless the selected profile or ADRIVE_AUTH_ENDPOINT supplies it", "OAuth 登录授权服务器；除非所选 profile 或 ADRIVE_AUTH_ENDPOINT 已提供，否则必填"),
+    ("OAuth Authorization Server for login; defaults to the effective endpoint after command/profile/environment Auth overrides", "OAuth 登录授权服务器；优先使用命令行、profile 和认证环境变量，未设置时回退到有效 endpoint"),
     ("Human-readable device name shown during OAuth authorization", "OAuth 授权期间显示的人类可读设备名称"),
     ("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
     ("Execute the CLI command; false returns a plan only", "执行 CLI 命令；false 时仅返回计划"),
@@ -376,10 +384,11 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("create/get/list/update/cancel use the V1 share management APIs with the selected account authentication", "create/get/list/update/cancel 使用 V1 分享管理 API 和所选账户鉴权"),
     ("delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders", "文件和文件夹的交付 URL 均由分享页面域名和 /share/<编码后的 ShareID> 拼接"),
     ("inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token", "inspect/files/view/download 默认匿名接收公开分享 URL；显式 --auth-mode oauth 使用接收者 profile 获取概况及交换 token，后续文件 API 仅携带 x-share-token"),
-    ("files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume", "files 支持单个文件或一页目录列表；递归下载构建有界清单，并支持文件级 checkpoint 恢复"),
+    // [Review Fix #ShareFilesMaxKeysRouting] Routing discovery describes a logical result cap rather than a single service page.
+    ("files supports a single file or a bounded current-level listing across service pages; recursive downloads build a bounded manifest and support file-level checkpoint resume", "files 支持单个文件或跨服务分页的当前层级有界列表；递归下载构建有界清单，并支持文件级 checkpoint 恢复"),
     // [Review Fix #LiveDocs1] Share Describe/export uses this independent translation catalog.
-    (crate::cli::share::SHARE_CONNECTION_HELP, "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-base-url，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
-    (crate::cli::share::SHARE_DOWNLOAD_HELP, "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点。恢复时比较解析后的根目录。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 需要分享者开启 --permission download。"),
+    (crate::cli::share::SHARE_CONNECTION_HELP, "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-endpoint，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
+    (crate::cli::share::SHARE_DOWNLOAD_HELP, "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点，返回 Conflict（退出码 9）并提示选择普通本地目标路径。恢复时比较解析后的根目录；已完成本地文件的大小或摘要改变同样返回 Conflict（退出码 9）。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。实际下载会创建目录、临时文件，以及指定时的 checkpoint 和锁文件；预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。--overwrite 仅在校验通过后替换现有普通文件。下载 URL 签发可能消耗下载次数配额，即使后续内容传输失败。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 可能表示分享权限禁止下载或下载次数配额耗尽；仅凭该服务端错误码无法区分。请分享者检查权限及配额；保留服务端错误码、HTTP 状态和 request ID。"),
 ];
 
 const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
@@ -469,9 +478,11 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
             "create/get/list/update/cancel use the V1 share management APIs with the selected account authentication",
             "delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders",
             "inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token",
-            "files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume",
+            // [Review Fix #ShareFilesMaxKeysRouting] Keep the routing phrase aligned with files help and Describe.
+            "files supports a single file or a bounded current-level listing across service pages; recursive downloads build a bounded manifest and support file-level checkpoint resume",
             crate::cli::share::SHARE_CONNECTION_HELP,
             crate::cli::share::SHARE_DOWNLOAD_HELP,
+            crate::cli::share::SHARE_DOWNLOAD_SELECTION_HELP,
             crate::cli::share::SHARE_SELECTOR_HELP,
             crate::cli::share::SHARE_LIST_HELP,
             crate::cli::share::SHARE_SETTINGS_HELP,
@@ -1369,6 +1380,7 @@ fn is_boolean_parameter(name: &str) -> bool {
             | "by-name"
             | "recursive"
             | "include-parent"
+            | "disable-dir-object"
             | "include-uploads"
             | "index-enabled"
             | "parents"
@@ -1818,8 +1830,8 @@ pub async fn handle_config_command(
                         if let Some(ref f) = eff.auth_mode {
                             push_traced_row(&mut rows, eff, "auth_mode", f);
                         }
-                        if let Some(ref f) = eff.share_base_url {
-                            push_traced_row(&mut rows, eff, "share_base_url", f);
+                        if let Some(ref f) = eff.share_endpoint {
+                            push_traced_row(&mut rows, eff, "share_endpoint", f);
                         }
                         if let Some(ref f) = eff.auth_endpoint {
                             push_traced_row(&mut rows, eff, "auth_endpoint", f);
@@ -1906,6 +1918,8 @@ pub async fn handle_config_command(
             Ok(0)
         }
         ConfigAction::Set { key, value } => {
+            let canonical_key = canonical_adrive_config_key(key);
+            let key = &canonical_key;
             if is_sensitive_adrive_config_key(key) {
                 return handle_adrive_credential_set(global, key, value);
             }
@@ -2108,6 +2122,8 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
             }
         }
         ConfigAction::Set { key, value } => {
+            let canonical_key = canonical_adrive_config_key(key);
+            let key = &canonical_key;
             let segments = adrive_config_key_segments(global, key)?;
             let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
             let mut validation_config = ConfigFile::default();
@@ -2181,6 +2197,21 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
         &Envelope::success(config_action_command(action), dry_run),
     )?;
     Ok(0)
+}
+
+fn canonical_adrive_config_key(key: &str) -> String {
+    // [Review Fix #ShareEndpoint4] Legacy input must generate canonical plans and saved-field messages without changing other namespaces.
+    let mut segments = key.split('.').collect::<Vec<_>>();
+    match segments.as_mut_slice() {
+        [field] if *field == "share_base_url" => *field = "share_endpoint",
+        [_, namespace, field]
+            if Binary::parse(namespace) == Some(Binary::Adrive) && *field == "share_base_url" =>
+        {
+            *field = "share_endpoint";
+        }
+        _ => {}
+    }
+    segments.join(".")
 }
 
 fn adrive_config_key_segments(global: &GlobalArgs, key: &str) -> Result<Vec<String>, CliError> {
@@ -2541,20 +2572,20 @@ fn validate_selected_share_origin(config: &ConfigFile, profile_name: &str) -> Re
         .profiles
         .get(profile_name)
         .and_then(|profile| profile.adrive.as_ref())
-        .and_then(|settings| settings.share_base_url.as_deref())
+        .and_then(|settings| settings.share_endpoint.as_deref())
     {
-        tos_core::infra::config::validate_share_base_url(origin)?;
+        tos_core::infra::config::validate_share_endpoint(origin)?;
     }
     Ok(())
 }
 
 fn redact_invalid_share_origin(effective: &mut EffectiveProfile) {
     // [Review Fix #ShareOrigin2] Displaying another profile must not disclose credentials embedded in an invalid origin.
-    if let Some(field) = &mut effective.share_base_url {
+    if let Some(field) = &mut effective.share_endpoint {
         if field
             .value
             .as_deref()
-            .is_some_and(|origin| tos_core::infra::config::validate_share_base_url(origin).is_err())
+            .is_some_and(|origin| tos_core::infra::config::validate_share_endpoint(origin).is_err())
         {
             field.value = Some("[invalid share page origin]".into());
         }
@@ -2765,20 +2796,11 @@ async fn run_mcp_sse(global: &GlobalArgs, port: u16) -> Result<(), CliError> {
 
 fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, CliError> {
     use std::sync::Arc;
-    use tos_core::mcp::{
-        ToolDispatcher, ToolEntry, ToolInvocation, ToolInvocationResult, TosMcpServer,
-    };
+    use tos_core::mcp::{ToolDispatcher, ToolInvocation, ToolInvocationResult, TosMcpServer};
 
     let entries = skill_definitions()
         .into_iter()
-        .map(|skill| {
-            ToolEntry::from_parts(
-                skill.name,
-                skill.description,
-                skill.input_schema,
-                matches!(skill.risk_level.as_str(), "high" | "critical"),
-            )
-        })
+        .map(mcp_tool_entry)
         .collect::<Vec<_>>();
 
     struct ADriveDispatcher {
@@ -2808,6 +2830,34 @@ fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, 
         entries,
         dispatcher,
     ))
+}
+
+fn mcp_tool_entry(skill: SkillDefinition) -> tos_core::mcp::ToolEntry {
+    let is_download = skill.internal_command == "ve-adrive share download";
+    let description = mcp_tool_description(&skill);
+    let mut entry = tos_core::mcp::ToolEntry::from_parts(
+        skill.name,
+        description,
+        skill.input_schema,
+        matches!(skill.risk_level.as_str(), "high" | "critical"),
+    );
+    if is_download {
+        // [Review Fix #D02Docs] Keep annotation construction separate from server startup; non-destructive downloads still write files.
+        entry
+            .tool
+            .annotations
+            .get_or_insert_with(Default::default)
+            .read_only_hint = Some(false);
+    }
+    entry
+}
+
+fn mcp_tool_description(skill: &SkillDefinition) -> String {
+    if skill.internal_command == "ve-adrive share download" {
+        // [Review Fix #D02Docs] Expose network planning and local writes before an MCP caller decides whether to execute.
+        return format!("{} Plans argv without I/O by default. With execute=true and dry_run=true, query share metadata and return a read-only download plan. With execute=true and no dry_run, create local directories/temp files/checkpoint locks as requested; overwrite requires an explicit flag and URL issuance may consume download quota. Use describe=true with execute=true for the full contract.", skill.description);
+    }
+    skill.description.clone()
 }
 
 async fn mcp_invoke_tool(
@@ -2967,6 +3017,15 @@ fn build_mcp_prepared_argv(
     command: &str,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Vec<String>, CliError> {
+    // [Review Fix #DirectoryMcpType] Reject malformed opt-outs instead of silently enabling directory writes.
+    if arguments
+        .get("disable-dir-object")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(CliError::ValidationError(
+            "disable-dir-object must be boolean".into(),
+        ));
+    }
     let row = find_capability(command).ok_or_else(|| {
         CliError::ValidationError(format!("unknown typed MCP command '{}'", command))
     })?;
@@ -3269,6 +3328,7 @@ async fn run_mcp_typed_argv(
     password: Option<String>,
 ) -> Result<McpCommandExecution, CliError> {
     let exe = std::env::current_exe()?;
+    let argv = mcp_process_argv(command, argv, &adrive_example_prefix())?;
     let timeout_seconds = if command.contains("share download") {
         3600
     } else {
@@ -3315,6 +3375,36 @@ async fn run_mcp_typed_argv(
         stdout,
         stderr,
     })
+}
+
+fn mcp_process_argv(
+    command: &str,
+    mut argv: Vec<String>,
+    prefix: &str,
+) -> Result<Vec<String>, CliError> {
+    if prefix != "ve-adrive-cli" {
+        return Ok(argv);
+    }
+    let command_parts = command.split_whitespace().collect::<Vec<_>>();
+    if command_parts.len() < 2 || command_parts[0] != "ve-adrive" {
+        return Err(CliError::ValidationError(
+            "invalid MCP ADrive command path".into(),
+        ));
+    }
+    let command_index = argv
+        .windows(command_parts.len())
+        .position(|parts| {
+            parts
+                .iter()
+                .map(String::as_str)
+                .eq(command_parts.iter().copied())
+        })
+        .ok_or_else(|| {
+            CliError::ValidationError("MCP command path is missing from prepared arguments".into())
+        })?;
+    // [Review Fix #D02Mcp] The direct entrypoint inserts its own ve-adrive prefix; match the full command so a same-named profile/path is not removed.
+    argv.remove(command_index);
+    Ok(argv)
 }
 
 fn string_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -4096,8 +4186,100 @@ fn completion_check() -> DoctorCheck {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directory_mcp_rejects_non_boolean_opt_out() {
+        for value in [json!("true"), json!(1), Value::Null] {
+            let arguments = json!({"source":"./src", "destination":"adrive://i/s/prefix/", "recursive":true,
+                                   "disable-dir-object":value});
+            let error = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "ve-adrive cp",
+                arguments.as_object().unwrap(),
+            )
+            .expect_err("invalid directory opt-out");
+            assert!(
+                error
+                    .to_string()
+                    .contains("disable-dir-object must be boolean"),
+                "{error}"
+            );
+        }
+    }
+
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn legacy_share_config_keys_canonicalize_only_the_adrive_namespace() {
+        for (source, expected) in [
+            ("share_base_url", "share_endpoint"),
+            (
+                "chosen.adrive.share_base_url",
+                "chosen.adrive.share_endpoint",
+            ),
+            ("chosen.tos.share_base_url", "chosen.tos.share_base_url"),
+            ("chosen.share_base_url", "chosen.share_base_url"),
+            ("chosen.adrive.endpoint", "chosen.adrive.endpoint"),
+        ] {
+            assert_eq!(canonical_adrive_config_key(source), expected);
+        }
+    }
+
+    #[test]
+    fn share_files_mcp_schema_and_argv_use_bounded_max_keys() {
+        let command = "ve-adrive share files";
+        let schema = skill_input_schema(find_capability(command).unwrap());
+        assert_eq!(schema["properties"]["max-keys"]["type"], "integer");
+        assert_eq!(schema["properties"]["max-keys"]["default"], 1000);
+        assert_eq!(schema["properties"]["max-keys"]["minimum"], 1);
+        assert_eq!(schema["properties"]["max-keys"]["maximum"], i32::MAX);
+        assert!(schema["properties"].get("limit").is_none());
+        for max_keys in [1, i32::MAX] {
+            let arguments = json!({"share-url":"https://x.test/share/s","max-keys":max_keys});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair == ["--max-keys", &max_keys.to_string()]));
+        }
+    }
+
+    #[test]
+    fn share_files_mcp_rejects_invalid_caps_and_legacy_limit() {
+        for max_keys in [
+            json!(0),
+            json!(-1),
+            json!(i64::from(i32::MAX) + 1),
+            json!("5"),
+        ] {
+            let arguments = json!({"share-url":"https://x.test/share/s","max-keys":max_keys});
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "ve-adrive share files",
+                arguments.as_object().unwrap(),
+            )
+            .is_err());
+        }
+        let arguments = json!({"share-url":"https://x.test/share/s","limit":1});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share files",
+            arguments.as_object().unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn share_download_mcp_has_no_listing_pagination_flags() {
+        let schema = skill_input_schema(find_capability("ve-adrive share download").unwrap());
+        for name in ["max-keys", "marker", "limit"] {
+            assert!(schema["properties"].get(name).is_none());
+        }
+    }
 
     #[test]
     fn share_mcp_management_uri_omits_instance_and_rejects_conflicts() {
@@ -4290,6 +4472,38 @@ mod tests {
         }
     }
     #[test]
+    fn mcp_execution_adapts_direct_entrypoint_without_removing_same_named_profile() {
+        let argv = [
+            "--profile",
+            "ve-adrive",
+            "--output",
+            "json",
+            "ve-adrive",
+            "share",
+            "download",
+            "http://page.test/share/s",
+            "./out",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            mcp_process_argv(
+                "ve-adrive share download",
+                argv.clone(),
+                "ve-storage-uni-cli ve-adrive"
+            )
+            .unwrap(),
+            argv
+        );
+        let direct =
+            mcp_process_argv("ve-adrive share download", argv.clone(), "ve-adrive-cli").unwrap();
+        assert_eq!(&direct[..4], &argv[..4]);
+        assert_eq!(&direct[4..], &argv[5..]);
+        assert!(mcp_process_argv("", argv.clone(), "ve-adrive-cli").is_err());
+        assert!(mcp_process_argv("ve-adrive files", argv, "ve-adrive-cli").is_err());
+    }
+
+    #[test]
     fn cp_mcp_checkpoint_remains_a_boolean_switch() {
         let arguments =
             json!({"source":"./a","destination":"adrive://i/s/a","checkpoint":true,"force":false});
@@ -4347,7 +4561,7 @@ mod tests {
         let config_path = directory.join("config.toml");
         std::fs::write(
             &config_path,
-            "[default.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+            "[default.adrive]\nshare_endpoint='https://user:must-not-echo@bad.test'\n",
         )
         .unwrap();
         let global = GlobalArgs {
@@ -4374,7 +4588,7 @@ mod tests {
         let path = directory.join("config.toml");
         std::fs::write(
             &path,
-            "[other.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+            "[other.adrive]\nshare_endpoint='https://user:must-not-echo@bad.test'\n",
         )
         .unwrap();
         let config = ConfigFile::load_from(&path).unwrap();

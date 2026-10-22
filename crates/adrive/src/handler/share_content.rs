@@ -268,7 +268,10 @@ pub(crate) async fn local_digest(
             .checked_add(count as u64)
             .ok_or_else(|| failed("local size overflow"))?;
         if length > expected_size {
-            return Err(failed("completed local file changed since checkpoint"));
+            // [Review Fix #D03] A completed checkpoint no longer matches local bytes; retrying transfer cannot resolve this conflict.
+            return Err(CliError::Conflict(
+                "completed local file changed since checkpoint".into(),
+            ));
         }
         digest.update(&buffer[..count]);
         tokio::task::yield_now().await;

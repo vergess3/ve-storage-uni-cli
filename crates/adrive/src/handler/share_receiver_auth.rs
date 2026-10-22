@@ -86,7 +86,7 @@ mod tests {
                 share_url,
                 path: Some("docs/".into()),
                 marker: Some("previous-page".into()),
-                limit: Some(2),
+                max_keys: 2,
                 is_password_stdin: false,
             })),
         }
@@ -254,10 +254,7 @@ mod tests {
                 200,
                 r#"{"AccessToken":"receiver-share-token","ExpiresIn":60}"#,
             ),
-            reply(
-                200,
-                r#"{"Files":[],"Folders":[],"NextMarker":"next-page","IsTruncated":true}"#,
-            ),
+            reply(200, r#"{"Files":[],"Folders":[],"IsTruncated":false}"#),
         ]);
         let (global, directory) = oauth_config(&fixture.endpoint);
         let result = super::super::share::handle_share_command(

@@ -52,7 +52,11 @@ use crate::registry::{
     CommandTreeEntry, RegistryCapabilityRow,
 };
 
+#[path = "mcp_entrypoint.rs"]
+mod mcp_entrypoint;
+
 const VE_TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     // [Review Fix #2] The shared Skill export parameter must be localized on ve-tos Describe.
     ("Skill name, canonical command, or command suffix, e.g. ve_tos_cp or cp", "Skill 名称、规范命令或命令后缀，例如 ve_tos_cp 或 cp"),
     ("ACL value", "ACL 值"),
@@ -3041,6 +3045,20 @@ fn build_mcp_typed_argv(
     command: &str,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Vec<String>, CliError> {
+    // [Review Fix #DirectoryMcpType] Registry uses the public flag name; clap stores its Rust field ID.
+    let mut arguments = arguments.clone();
+    if let Some(value) = arguments.remove("disable-dir-object") {
+        arguments.insert("disable_dir_object".into(), value);
+    }
+    if arguments
+        .get("disable_dir_object")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(CliError::ValidationError(
+            "disable-dir-object must be boolean".into(),
+        ));
+    }
+    let arguments = &arguments;
     let entry = find_command_tree_entry(command).ok_or_else(|| {
         CliError::ValidationError(format!("unknown typed MCP command '{}'", command))
     })?;
@@ -3242,6 +3260,8 @@ async fn run_mcp_typed_argv(
     argv: Vec<String>,
 ) -> Result<McpCommandExecution, CliError> {
     let exe = std::env::current_exe()?;
+    let is_direct = public_tos_command("ve-tos ls").starts_with("ve-tos-cli ");
+    let argv = mcp_entrypoint::process_argv(command, argv, is_direct)?;
     let output = timeout(
         Duration::from_secs(300),
         TokioCommand::new(exe).args(&argv).output(),
@@ -4432,6 +4452,7 @@ fn registry_parameter_schema_type(name: &str) -> &'static str {
         | "size-only"
         | "exact-timestamps"
         | "include-parent"
+        | "disable-dir-object"
         | "parents"
         | "all-versions"
         | "include-uploads"
@@ -4492,6 +4513,26 @@ fn contains_ignore_case(value: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directory_mcp_rejects_non_boolean_opt_out() {
+        for value in [json!("true"), json!(1), Value::Null] {
+            let arguments = json!({"source":"./src", "destination":"tos://bucket/prefix/", "recursive":true,
+                                   "disable-dir-object":value});
+            let error = build_mcp_typed_argv(
+                &test_global_args(),
+                "ve-tos cp",
+                arguments.as_object().unwrap(),
+            )
+            .expect_err("invalid directory opt-out");
+            assert!(
+                error
+                    .to_string()
+                    .contains("disable-dir-object must be boolean"),
+                "{error}"
+            );
+        }
+    }
+
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -2,7 +2,7 @@
 
 ## 1. 文档状态与适用范围
 
-- 状态：**Frozen**
+- 状态：**Frozen**；Endpoint 契约于 2026-10-21 按用户确认修订
 - 冻结日期：2026-08-01
 - 适用客户端：仅 `ve-adrive-cli`
 - 服务端依据：[IDS CLI 登录技术方案](https://bytedance.larkoffice.com/wiki/OScPwVIMyiNBlbkDOzPcrbWwnLb)，Revision 23
@@ -17,7 +17,7 @@
 1. OAuth 与 AK/SK 是两套显式、互斥的认证策略，不做隐式探测或相互降级。
 2. OAuth 使用 RFC 8628 Device Authorization Grant；CLI 是 Public/Native Client，不持有或发送 `client_secret`。
 3. ADrive Resource Server 的所有接口都接受 Bearer Token。
-4. IDS OAuth Authorization Server 使用独立于 ADrive Resource Server 的域名与配置项。
+4. OAuth Auth endpoint 可单独覆盖；未设置时使用有效 Resource endpoint，允许同 Origin。2026-10-21 用户确认支持显式 HTTP(S)，保留原协议。
 5. 登录时固定发送字面值 `scope=all`，CLI 不展开、不允许覆盖该值。
 6. 只有明确可恢复的认证失败才触发 Refresh Token；CLI 永远不会自动发起需要用户参与的重新登录。
 7. Access Token、Refresh Token、Device Code 不得出现在 URL、普通输出、日志或错误信息中。
@@ -43,17 +43,17 @@ Auth Mode 继续使用既有优先级：
 | 配置 | 用途 | 冻结规则 |
 |---|---|---|
 | `endpoint` | ADrive Resource Server | 必须显式配置；允许从可识别 Endpoint 解析 Region，不允许从 Region 构造 Endpoint |
-| `auth_endpoint` | IDS OAuth Authorization Server | 必须通过命令行、配置文件或环境变量显式配置，不得从资源 `endpoint` 或 Region 推导 |
+| `auth_endpoint` | IDS OAuth Authorization Server | 优先使用命令行、配置文件或认证环境变量，未设置时回退到有效资源 `endpoint`；不从 Region 生成域名 |
 
-`auth_endpoint` 与资源 `endpoint` 是两个独立域名。Device Authorization 和 Token 请求只发送到 `auth_endpoint`；业务请求只发送到资源 `endpoint`。两个 Endpoint 解析后的 Origin 必须不同，否则 CLI 在发请求前返回配置错误。
+2026-10-21 修订：`auth_endpoint` 与资源 `endpoint` 允许相同 Origin。Device Authorization 和 Token 请求发到解析后的 Auth endpoint；业务请求发到资源 endpoint。显式 Auth 覆盖优先于 Resource fallback，不探测其他域名。
 
-Endpoint 必须是无 Userinfo、Query 和 Fragment 的绝对 HTTP(S) Base URL，比较和持久化前统一规范化 Scheme、Host、默认端口和末尾斜杠。正式与持久配置必须使用 HTTPS；仅测试时允许显式使用 HTTP loopback 地址。
+Endpoint 必须是无 Userinfo、Query 和 Fragment 的绝对 HTTP(S) Base URL，比较和持久化前统一规范化 Scheme、Host、默认端口和末尾斜杠。显式配置支持 HTTP 和 HTTPS，保留原协议；未写协议的裸域名默认补 HTTPS。验证页面 URL 同样支持 HTTP(S)。
 
 ### 4.2 输入解析优先级
 
 | 输入 | 优先级 | 缺失行为 |
 |---|---|---|
-| Auth Endpoint | `--auth-endpoint` > `[profile.adrive].auth_endpoint` > `ADRIVE_AUTH_ENDPOINT` | 返回 `oauth_auth_endpoint_required`，不发请求 |
+| Auth Endpoint | `--auth-endpoint` > `[profile.adrive].auth_endpoint` > `ADRIVE_AUTH_ENDPOINT` > 有效资源 endpoint | 两类地址均缺失时返回 `oauth_auth_endpoint_required`，不发请求 |
 | OAuth Client ID | 非空 `ADRIVE_OAUTH_CLIENT_ID` > CLI 内置常量 `global_74c584` | 正式发行使用内置线上 Client ID；测试环境通过进程环境变量覆盖 |
 | Instance ID | `--instance` > `[profile.adrive].default_instance` > `ADRIVE_DEFAULT_INSTANCE` | 返回参数缺失错误，不发请求 |
 | Device Name | `--device-name` > `ADRIVE_DEVICE_NAME` > 本机 hostname > `ve-adrive-cli` | 使用 `ve-adrive-cli` |
