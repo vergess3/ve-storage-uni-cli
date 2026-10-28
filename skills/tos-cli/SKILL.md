@@ -151,4 +151,6 @@ tos-cli sync ./dir tos://bucket/prefix/ --dry-run
 tos-cli presign tos://bucket/key --expires 3600 --output json
 ```
 
+Local-directory uploads with `cp --recursive` and `sync` preserve selected directories, including empty directories, by default. `--disable-dir-object` skips explicit directory uploads; it is valid only for local-directory uploads. Files can still create required parents in HNS/ADrive. FNS directory markers are zero-byte keys ending in `/`; HNS directory objects use STANDARD rather than a file-only storage-class override. Both manifest and `--no-manifest` execution preserve the same directory policy. An empty source creates the effective destination folder when a non-root path exists; `--include-parent` retains the source basename. Directory tasks count as items with zero bytes. The switch does not authorize deleting source-present directories during `sync --delete`.
+
 Use `tos-cli <command> --help` when flags are uncertain.
