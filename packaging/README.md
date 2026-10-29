@@ -153,6 +153,18 @@ can push to your `winget-pkgs` fork before opening the PR.
 | Homebrew Formulae     | `git`, access to the source repository checkout | The generator writes Ruby formulae into `Formula/`; use `--tap-dir .` for this repository, and only add commit/push flags when this checkout should publish directly. |
 | WinGet manifests      | Python 3, `git`, GitHub CLI (`gh`)              | Manifest generation writes `dist/winget` and can run on macOS; publish by copying those files into a `winget-pkgs` fork and opening a PR.                         |
 
+Source builds use reqwest 0.13 with Rustls/AWS-LC and require the target's native C
+build toolchain in addition to Rust; some AWS-LC configurations also require
+CMake. Cross-build runners must provide the matching native toolchain. Release
+binaries validate HTTPS through platform certificate facilities; Linux images
+must include their system CA bundle (usually the `ca-certificates` package).
+
+For TLS regression checks, run `cargo test -p tos-core --test test_tls`. After
+building the unified and three dedicated debug binaries into `target/debug`,
+run `python3 tests/http_tls_regression.py` to check untrusted-CA rejection on all
+six command surfaces. An opt-in, credential-free system-trust probe is available:
+`VE_STORAGE_TLS_TEST_URL=https://example.com cargo test -p tos-core --test test_tls platform_and_sdk_clients_accept_system_trusted_https -- --ignored --exact`.
+
 For local smoke runs, omit execute/upload flags and the script prints the
 registry commands without publishing. For `all --publish`, the runner needs all
 tools above plus credentials for every registry destination. Homebrew needs
